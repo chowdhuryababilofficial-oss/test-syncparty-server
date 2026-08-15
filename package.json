@@ -1,0 +1,13 @@
+{
+  "name": "syncparty-relay",
+  "version": "0.5.3",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "public": "node public.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.3",
+    "localtunnel": "^2.0.2"
+  }
+}
