@@ -65,8 +65,60 @@ wss.on("connection", ws => {
     if (m.type === "message" && s.room === norm(m.room)) {
       const p = m.payload;
       if (!p || typeof p !== "object") return;
-      if (p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
-      broadcast(s.room, { type: "message", payload: p }, ws);
+
+      // Synchronization events are page-specific, but chat/presence/profile/
+      // stickers/reactions must be room-wide. The old relay applied the
+      // pageKey filter to every packet, which could silently discard peer
+      // presence and chat when participants were on different URL variants.
+      const roomWideKinds = new Set([
+        "chat", "sticker", "typing", "presence", "profile",
+        "messageReaction", "reaction", "buffering", "system"
+      ]);
+      if (!roomWideKinds.has(String(p.kind || "")) &&
+          p.pageKey && s.pageKey && p.pageKey !== s.pageKey) {
+        return;
+      }
+
+      // Keep the server's canonical client identity available to clients.
+      const profile = sanitizeProfile(p);
+      if (p.kind === "profile" || p.kind === "presence" || p.kind === "chat" || p.kind === "sticker") {
+        s.profile = profile;
+      }
+
+      broadcast(s.room, {
+        type: "message",
+        payload: {
+          ...p,
+          id: p.id || s.id,
+          name: profile.name,
+          avatar: profile.avatar,
+          color: profile.color
+        }
+      }, ws);
+
+      // Profile/presence changes also immediately update the authoritative
+      // participant list for every connected room member.
+      if (p.kind === "profile" || p.kind === "presence") broadcastPeers(s.room);
+      return;
+    }
+
+    // Explicit leave support. Browsers still also get the close() path if
+    // the socket disappears unexpectedly.
+    if (m.type === "leave" && s.room === norm(m.room)) {
+      const oldRoom = s.room;
+      const name = s.profile?.name || "Someone";
+      rooms.get(oldRoom)?.delete(ws);
+      if (rooms.get(oldRoom)?.size) {
+        broadcastPeers(oldRoom);
+        broadcast(oldRoom, {
+          type: "message",
+          payload: { kind: "system", text: `${name} left the party`, t: Date.now() }
+        });
+      } else {
+        rooms.delete(oldRoom);
+      }
+      s.room = null;
+      return;
     }
   });
 
