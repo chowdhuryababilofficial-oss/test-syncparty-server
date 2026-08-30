@@ -1,8 +1,8 @@
 # SyncParty relay
 
-The relay is a ~90-line WebSocket server. It only ever carries room
-membership, play/pause/seek events, chat, typing indicators and reaction
-pings — never the movie stream itself.
+The relay is a lightweight WebSocket server. It carries room membership, synchronized playback events, chat, typing, reactions, and the canonical room destination URL — never the movie stream itself.
+
+Protocol note: version 0.6.0 adds stable `clientId` replacement, `room-info` destination routing, and room-wide `navigate` messages.
 
 You have two ways to run it. **Option A removes the "run a server every
 time" step entirely** — do it once and every install of the extension
