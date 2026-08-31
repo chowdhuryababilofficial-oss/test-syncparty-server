@@ -76,7 +76,10 @@ create table if not exists public.scrapbook_entries (
   relation_id text references public.relations(id) on delete cascade,
   source_key text not null,
   title text not null,
-  kind text not null check (kind in ('movie','series')),
+  kind text not null check (kind in ('movie','series','anime')),
+  content_type text not null default 'movie' check (content_type in ('movie','series','anime')),
+  canonical_title text,
+  artwork text,
   thumbnail text,
   platform text not null default '',
   season integer,
@@ -142,3 +145,16 @@ $$;
 
 revoke execute on function public.cleanup_expired_syncparty_sessions() from public, anon, authenticated;
 grant execute on function public.cleanup_expired_syncparty_sessions() to service_role;
+
+
+-- Scrapbook 2.0 migration for an existing Supabase database. Run after the original schema.
+alter table public.scrapbook_entries drop constraint if exists scrapbook_entries_kind_check;
+alter table public.scrapbook_entries add constraint scrapbook_entries_kind_check check (kind in ('movie','series','anime'));
+alter table public.scrapbook_entries add column if not exists content_type text;
+alter table public.scrapbook_entries add column if not exists canonical_title text;
+alter table public.scrapbook_entries add column if not exists artwork text;
+update public.scrapbook_entries set content_type = kind where content_type is null;
+update public.scrapbook_entries set canonical_title = title where canonical_title is null;
+alter table public.scrapbook_entries alter column content_type set default 'movie';
+alter table public.scrapbook_entries alter column content_type set not null;
+alter table public.scrapbook_entries add constraint scrapbook_entries_content_type_check check (content_type in ('movie','series','anime'));

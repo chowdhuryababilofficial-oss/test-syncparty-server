@@ -18,7 +18,10 @@ function rowToEntry(row) {
     sourceKey: row.source_key,
     title: row.title,
     kind: row.kind,
+    contentType: row.content_type || row.kind,
     thumbnail: row.thumbnail,
+    artwork: row.artwork || row.thumbnail || null,
+    canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
     season: row.season == null ? null : Number(row.season),
     episode: row.episode == null ? null : Number(row.episode),
@@ -37,14 +40,19 @@ function normalizeEntry(entry, existing = null) {
   return {
     source_key: String(entry.sourceKey || existing?.source_key || "").slice(0, 180),
     title: String(entry.title || existing?.title || "Untitled").slice(0, 240),
-    kind: entry.kind === "series" ? "series" : "movie",
+    kind: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.kind || "movie"),
+    content_type: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
+    canonical_title: String(entry.canonicalTitle || existing?.canonical_title || entry.title || existing?.title || "Untitled").slice(0,240),
+    artwork: entry.artwork ? String(entry.artwork).slice(0,2000) : (existing?.artwork || null),
     thumbnail: entry.thumbnail ? String(entry.thumbnail).slice(0, 2000) : (existing?.thumbnail || null),
     platform: String(entry.platform || existing?.platform || "").slice(0, 80),
     season: Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
     episode: Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
     progress: Math.max(0, Math.min(1, Number(entry.progress) || Number(existing?.progress || 0))),
     status: ["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching"),
-    watch_duration_sec: Math.max(Number(existing?.watch_duration_sec || 0), Number(entry.watchDurationSec) || 0),
+    watch_duration_sec: existing
+      ? Math.max(0, Number(existing.watch_duration_sec || 0) + (Number(entry.watchDurationDeltaSec) || 0))
+      : Math.max(0, Number(entry.watchDurationDeltaSec) || Number(entry.watchDurationSec) || 0),
     first_watched_at: Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t),
     last_watched_at: Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t),
     updated_at: t
