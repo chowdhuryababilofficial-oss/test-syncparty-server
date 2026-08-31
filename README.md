@@ -51,3 +51,8 @@ same server in a LocalTunnel HTTPS tunnel and prints a temporary
 terminal open while you watch. This URL changes every time you restart
 the tunnel, so it can't be baked into a permanent invite link — that's
 exactly what Option A solves.
+
+
+## Sync Scrapbook API
+
+Version 0.7.0 adds the account and Scrapbook HTTP API used by the extension. Email/password accounts work with the bundled file store. Google Sign-In requires `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables; the extension uses the Chrome Identity redirect URI. For real cloud persistence, point `SYNCPARTY_DATA_DIR` at persistent storage on the deployment platform.

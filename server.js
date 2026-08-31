@@ -1,5 +1,7 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
+const { load:loadScrapbookDB, save:saveScrapbookDB, id:sbId, publicUser, getUser, getRelation, relationView, upsertEntry } = require("./scrapbook-store");
+const { normalizeEmail, createEmailUser, authenticateEmail, createSession, resolveSession, revokeSession } = require("./auth-store");
 const port = Number(process.env.PORT || 8787);
 
 // One live WebSocket per stable clientId. A browser tab keeps clientId in
@@ -13,9 +15,94 @@ const navigationTransitions = new Map(); // room -> active readiness barrier
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-  res.end(JSON.stringify({ ok: true, name: "SyncParty Relay", version: "0.6.0" }));
+function json(res, status, body, extra={}) {
+  res.writeHead(status, { "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"Content-Type, Authorization", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", ...extra });
+  res.end(JSON.stringify(body));
+}
+async function readJson(req) {
+  let raw=""; for await (const chunk of req) raw += chunk; try { return JSON.parse(raw || "{}"); } catch { return {}; }
+}
+function bearer(req) { return req.headers.authorization || ""; }
+function requireUser(req,res,db) { const user=resolveSession(db,bearer(req)); if(!user){json(res,401,{ok:false,error:"Sign in required."});return null;} return user; }
+function isValidPassword(p) { return typeof p === "string" && p.length >= 8 && p.length <= 128; }
+function googleConfig() { return { clientId: process.env.GOOGLE_CLIENT_ID || "" }; }
+const httpServer = http.createServer(async (req, res) => {
+  if (req.method === "OPTIONS") { json(res,204,{}); return; }
+  if (req.url === "/health" || req.url === "/") { json(res,200,{ ok:true, name:"SyncParty Relay", version:"0.7.0" }); return; }
+  if (!req.url.startsWith("/api/")) { json(res,404,{ok:false,error:"Not found"}); return; }
+  const db=loadScrapbookDB();
+  try {
+    const u=new URL(req.url,"http://localhost");
+    const path=u.pathname;
+    if (path === "/api/auth/google/config" && req.method === "GET") { json(res,200,{ok:true,...googleConfig()}); return; }
+    if (path === "/api/auth/signup" && req.method === "POST") {
+      const b=await readJson(req); const email=normalizeEmail(b.email);
+      if(!email || !email.includes("@")) {json(res,400,{ok:false,error:"Enter a valid email address."});return;}
+      if(!isValidPassword(b.password)) {json(res,400,{ok:false,error:"Password must be at least 8 characters."});return;}
+      const created=createEmailUser(db,{email,password:b.password,name:b.name});
+      if(created.error){json(res,409,{ok:false,error:created.error});return;}
+      const token=createSession(db,created.user.id); saveScrapbookDB(db); json(res,200,{ok:true,token,user:publicUser(created.user)}); return;
+    }
+    if (path === "/api/auth/login" && req.method === "POST") {
+      const b=await readJson(req); const user=authenticateEmail(db,b.email,b.password);
+      if(!user){json(res,401,{ok:false,error:"Email or password is incorrect."});return;}
+      const token=createSession(db,user.id); saveScrapbookDB(db); json(res,200,{ok:true,token,user:publicUser(user)}); return;
+    }
+    if (path === "/api/auth/logout" && req.method === "POST") { revokeSession(db,bearer(req)); saveScrapbookDB(db); json(res,200,{ok:true}); return; }
+    if (path === "/api/auth/me" && req.method === "GET") { const user=requireUser(req,res,db); if(!user)return; json(res,200,{ok:true,user:publicUser(user)}); return; }
+    if (path === "/api/auth/google/exchange" && req.method === "POST") {
+      if(!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET){json(res,503,{ok:false,error:"Google sign-in is not configured on this SyncParty server."});return;}
+      const b=await readJson(req); if(!b.code || !b.redirectUri){json(res,400,{ok:false,error:"Missing Google authorization data."});return;}
+      const tokenResp=await fetch("https://oauth2.googleapis.com/token",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:new URLSearchParams({code:b.code,client_id:process.env.GOOGLE_CLIENT_ID,client_secret:process.env.GOOGLE_CLIENT_SECRET,redirect_uri:b.redirectUri,grant_type:"authorization_code"})});
+      if(!tokenResp.ok){json(res,401,{ok:false,error:"Google authorization could not be completed."});return;}
+      const gt=await tokenResp.json(); const infoResp=await fetch("https://openidconnect.googleapis.com/v1/userinfo",{headers:{Authorization:`Bearer ${gt.access_token}`}});
+      if(!infoResp.ok){json(res,401,{ok:false,error:"Google profile could not be read."});return;}
+      const info=await infoResp.json(); let user=db.users.find(x=>x.provider==='google'&&x.googleSub===info.sub);
+      if(!user){user={id:sbId('user'),email:normalizeEmail(info.email),name:String(info.name||info.email?.split('@')[0]||'SyncParty user').slice(0,24),avatar:'🦊',color:'#54a0ff',provider:'google',googleSub:String(info.sub||'').slice(0,200),createdAt:Date.now()};db.users.push(user);}
+      else { user.name=String(info.name||user.name).slice(0,24); }
+      const session=createSession(db,user.id); saveScrapbookDB(db); json(res,200,{ok:true,token:session,user:publicUser(user)}); return;
+    }
+    if (path === "/api/scrapbook" && req.method === "GET") {
+      const user=requireUser(req,res,db); if(!user)return; const scope=u.searchParams.get("scope")==="shared"?"shared":"personal"; const relationId=u.searchParams.get("relationId")||null;
+      const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
+      const entries=db.entries.filter(e=>e.userId===user.id&&(scope==='shared'?String(e.scope||'').startsWith('shared:'):e.scope==='personal')&&(!relationId||e.relationId===relationId)).sort((a,b)=>b.lastWatchedAt-a.lastWatchedAt).slice(0,limit);
+      const relations=db.relations.filter(r=>r.userIds?.includes(user.id)).map(r=>relationView(db,r));
+      json(res,200,{ok:true,scope,entries,relations}); return;
+    }
+    if (path === "/api/scrapbook/entries" && req.method === "POST") {
+      const user=requireUser(req,res,db); if(!user)return; const b=await readJson(req);
+      let relation=null; if(b.scope==='shared'){ relation=db.relations.find(r=>r.id===b.relationId&&r.userIds?.includes(user.id)&&r.acceptedAt); if(!relation){json(res,409,{ok:false,error:"Shared Scrapbook is not active."});return;} }
+      const targets=b.scope==='shared'?relation.userIds:[user.id]; const created=[]; for(const uid of targets){created.push(upsertEntry(db,uid,b.entry,b.scope==='shared'?relation.id:null));}
+      json(res,200,{ok:true,entries:created}); return;
+    }
+    if (path === "/api/scrapbook/entries/bulk" && req.method === "POST") {
+      const user=requireUser(req,res,db); if(!user)return; const b=await readJson(req); const entries=Array.isArray(b.entries)?b.entries.slice(0,500):[]; const out=entries.map(e=>upsertEntry(db,user.id,e,null)); json(res,200,{ok:true,entries:out}); return;
+    }
+    if (path === "/api/scrapbook/relationship" && req.method === "GET") {
+      const user=requireUser(req,res,db); if(!user)return; const partnerId=u.searchParams.get('partnerId');
+      const relation=partnerId?getRelation(db,user.id,partnerId):null;
+      const pendingIncoming=db.invites.filter(i=>i.toUserId===user.id&&i.status==='pending').map(i=>({...i,fromUser:publicUser(getUser(db,i.fromUserId))}));
+      const pendingOutgoing=db.invites.filter(i=>i.fromUserId===user.id&&i.status==='pending').map(i=>({...i,toUser:publicUser(getUser(db,i.toUserId))}));
+      json(res,200,{ok:true,relation:relationView(db,relation),pendingIncoming,pendingOutgoing}); return;
+    }
+    if (path === "/api/scrapbook/relationship/invite" && req.method === "POST") {
+      const user=requireUser(req,res,db); if(!user)return; const b=await readJson(req); const partner=getUser(db,b.partnerId); if(!partner||partner.id===user.id){json(res,400,{ok:false,error:'Choose a valid partner account.'});return;}
+      const existing=getRelation(db,user.id,partner.id); if(existing?.acceptedAt){json(res,200,{ok:true,relation:relationView(db,existing)});return;}
+      const dupe=db.invites.find(i=>i.fromUserId===user.id&&i.toUserId===partner.id&&i.status==='pending'); if(dupe){json(res,200,{ok:true,invite:dupe});return;}
+      const invite={id:sbId('invite'),fromUserId:user.id,toUserId:partner.id,status:'pending',createdAt:Date.now()};db.invites.push(invite);saveScrapbookDB(db);json(res,200,{ok:true,invite});return;
+    }
+    if (path === "/api/scrapbook/relationship/respond" && req.method === "POST") {
+      const user=requireUser(req,res,db); if(!user)return; const b=await readJson(req); const inv=db.invites.find(i=>i.id===b.inviteId&&i.toUserId===user.id&&i.status==='pending'); if(!inv){json(res,404,{ok:false,error:'Invitation no longer exists.'});return;}
+      inv.status=b.accept?'accepted':'declined'; inv.respondedAt=Date.now();
+      let relation=null; if(b.accept){relation=getRelation(db,inv.fromUserId,inv.toUserId); if(!relation){const ids=[inv.fromUserId,inv.toUserId].sort();relation={id:sbId('rel'),userIds:ids,createdAt:Date.now(),acceptedAt:Date.now()};db.relations.push(relation);} else relation.acceptedAt=relation.acceptedAt||Date.now();}
+      saveScrapbookDB(db);json(res,200,{ok:true,relation:relationView(db,relation)});return;
+    }
+    if (path === "/api/scrapbook/highlights" && req.method === "GET") {
+      const user=requireUser(req,res,db); if(!user)return; const personal=db.entries.filter(e=>e.userId===user.id&&e.scope==='personal'); const minutes=Math.floor(personal.reduce((n,e)=>n+(e.watchDurationSec||0),0)/60); const completed=personal.filter(e=>e.status==='completed').length;
+      json(res,200,{ok:true,highlights:{totalEntries:personal.length,totalHours:Math.round(minutes/60*10)/10,completed,moments:[]}});return;
+    }
+    json(res,404,{ok:false,error:'Not found'});
+  } catch (e) { console.error('[SyncParty Scrapbook API]',e); json(res,500,{ok:false,error:'SyncParty server error.'}); }
 });
 
 const wss = new WebSocketServer({ server: httpServer });
@@ -29,6 +116,7 @@ function broadcast(room, o, skip = null) {
 }
 function sanitizeProfile(p) {
   return {
+    accountId: p?.accountId ? String(p.accountId).slice(0, 128) : null,
     name: String(p?.name || "Guest").slice(0, 24),
     avatar: String(p?.avatar || "🙂").slice(0, 4),
     color: String(p?.color || "#54a0ff").slice(0, 16)
@@ -54,6 +142,7 @@ function activeTransition(room) {
 function transitionPeerRecord(s) {
   return {
     id: s.clientId || s.id,
+    accountId: s.profile?.accountId || null,
     name: s.profile?.name || "Guest",
     avatar: s.profile?.avatar || "🙂",
     color: s.profile?.color || "#54a0ff"
