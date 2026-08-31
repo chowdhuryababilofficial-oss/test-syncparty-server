@@ -1,58 +1,34 @@
 # SyncParty relay
 
-The relay is a lightweight WebSocket server. It carries room membership, synchronized playback events, chat, typing, reactions, and the canonical room destination URL — never the movie stream itself.
+The relay carries room membership, synchronized playback events, chat, typing, reactions, navigation, and the canonical room destination URL. The WebSocket implementation remains unchanged by the persistent Scrapbook migration.
 
-Protocol note: version 0.6.0 adds stable `clientId` replacement, `room-info` destination routing, and room-wide `navigate` messages.
+## Persistent account + Scrapbook storage
 
-You have two ways to run it. **Option A removes the "run a server every
-time" step entirely** — do it once and every install of the extension
-just works. Option B is the old manual/local flow, still here for quick
-testing or if you'd rather not deploy anywhere.
+Version 0.7.1 stores SyncParty accounts, password metadata, session tokens, Google identity mappings, Shared Scrapbook relationships, invitations, and Scrapbook entries in Supabase Postgres instead of the previous local JSON stores. The extension API paths and JSON responses remain unchanged.
 
-## Option A — deploy once, free, no domain needed (recommended)
+### Setup
 
-Render, Fly.io and Railway all have a free tier that gives you a public
-`https://something.onrender.com`-style address with **no domain
-purchase required** — that address is enough, you don't need
-`syncparty.com` or anything like it.
+1. Create a Supabase project.
+2. Run `supabase-schema.sql` once in the Supabase SQL Editor.
+3. Add the environment variables below to Render.
+4. Deploy this server.
 
-Using Render (a `render.yaml` blueprint is already in this folder):
+### Render environment variables
 
-1. Push this repo (or just the `server/` folder) to a GitHub repo.
-2. On Render: **New → Blueprint**, point it at that repo. It reads
-   `render.yaml` and provisions a free web service automatically.
-3. Wait for the build to finish. Render gives you a URL like
-   `https://syncparty-relay-xxxx.onrender.com`.
-4. Your WebSocket address is the same host with `wss://` instead of
-   `https://` — e.g. `wss://syncparty-relay-xxxx.onrender.com`.
-5. Open `extension/background.js` and set:
-   ```js
-   const DEFAULT_RELAY = "wss://syncparty-relay-xxxx.onrender.com";
-   ```
-6. Reload the unpacked extension.
+Required:
 
-That's it — from now on, "Create a room" and the invite link both work
-for anyone who installs the extension, with nothing to start manually.
-(Free-tier instances on these platforms typically sleep after a period
-of inactivity and take a few seconds to wake on the next connection —
-fine for this use case, just not instant on the very first request.)
+- `SUPABASE_URL` — your Supabase project URL.
+- `SUPABASE_SERVICE_ROLE_KEY` — your server-only Supabase service-role/secret key.
 
-## Option B — local / no deployment
+Required for existing Google Sign-In:
 
-    npm install
-    npm start
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
 
-Use `ws://127.0.0.1:8787` in SyncParty's settings. Only works between
-browsers on the same PC.
+The Supabase service-role/secret key must never be placed in the Chrome extension or any other browser client.
 
-For long-distance without deploying anywhere, `npm run public` wraps the
-same server in a LocalTunnel HTTPS tunnel and prints a temporary
-`wss://...` URL — paste that into SyncParty on both ends and keep the
-terminal open while you watch. This URL changes every time you restart
-the tunnel, so it can't be baked into a permanent invite link — that's
-exactly what Option A solves.
+### Local development
 
+Set the same Supabase environment variables locally, then run `npm install` and `npm start`.
 
-## Sync Scrapbook API
-
-Version 0.7.0 adds the account and Scrapbook HTTP API used by the extension. Email/password accounts work with the bundled file store. Google Sign-In requires `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables; the extension uses the Chrome Identity redirect URI. For real cloud persistence, point `SYNCPARTY_DATA_DIR` at persistent storage on the deployment platform.
+The previous file-backed store is no longer used. This package does not automatically import an old JSON database; migrate legacy data separately before deleting the old file if you still have it.

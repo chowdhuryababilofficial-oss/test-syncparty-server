@@ -8,4 +8,12 @@ services:
     healthCheckPath: /
     envVars:
       - key: NODE_VERSION
-        value: 20
+        value: 24.14.1
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
