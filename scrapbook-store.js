@@ -159,9 +159,22 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     ...values,
     created_at: t
   };
-  const { data, error } = await sb.from("scrapbook_entries").insert(row).select("*").maybeSingle();
+  let { data, error } = await sb.from("scrapbook_entries").insert(row).select("*").maybeSingle();
   if (error) {
     if (error.code === "23505") return upsertEntry(userId, entry, sharedRelationId);
+    // An existing deployment may not yet have the optional artwork/title columns.
+    // Retry only the legacy-compatible fields; anime still correctly requires the
+    // existing kind/content_type constraint to permit it.
+    const modernSchemaError = /column .*?(content_type|canonical_title|artwork).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    if (modernSchemaError) {
+      const legacyRow = { ...row };
+      delete legacyRow.content_type;
+      delete legacyRow.canonical_title;
+      delete legacyRow.artwork;
+      const legacy = await sb.from("scrapbook_entries").insert(legacyRow).select("*").maybeSingle();
+      if (!legacy.error) return rowToEntry(legacy.data);
+      error = legacy.error;
+    }
     throw error;
   }
   return rowToEntry(data);

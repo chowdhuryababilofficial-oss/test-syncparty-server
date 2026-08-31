@@ -412,7 +412,7 @@ wss.on("connection", ws => {
       const kind = String(p.kind || "");
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
 
