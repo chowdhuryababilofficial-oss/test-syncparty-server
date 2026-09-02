@@ -9,6 +9,7 @@ const port = Number(process.env.PORT || 8787);
 // creating a second participant.
 const rooms = new Map();
 const roomTargets = new Map();
+const roomPlaybackState = new Map(); // room -> latest authoritative Spotify state/command
 const clients = new Map();
 const clientSockets = new Map();
 const navigationTransitions = new Map();
@@ -245,6 +246,7 @@ function cleanupTransitionParticipant(room, clientId) {
     navigationTransitions.delete(room);
     rooms.delete(room);
     roomTargets.delete(room);
+    roomPlaybackState.delete(room);
   }
 }
 function maybeReleaseTransition(room) {
@@ -337,6 +339,7 @@ function detachSocket(ws, announce = true, removeClient = true) {
     } else {
       rooms.delete(room);
       roomTargets.delete(room);
+      roomPlaybackState.delete(room);
       navigationTransitions.delete(room);
     }
   }
@@ -398,6 +401,20 @@ wss.on("connection", ws => {
       send(ws, { type: "you", id: s.id, clientId: s.clientId });
       send(ws, { type: "room-info", room, targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
       if (existingTransition) sendTransitionState(ws, existingTransition);
+      const cachedPlayback = roomPlaybackState.get(room);
+      if (cachedPlayback) {
+        // Replay the latest Spotify playback state to a late joiner. Keep the
+        // packet room-wide and bypass pageKey matching so the joiner can first
+        // navigate to the authoritative track when necessary.
+        send(ws, {
+          type: "message",
+          payload: {
+            ...cachedPlayback,
+            replay: true,
+            receivedAt: Date.now()
+          }
+        });
+      }
       broadcastPeers(room);
       // During an active navigation handoff, presence is continuous: do not emit
       // a generic joined-party chat line for a reconnecting/newly arrived socket.
@@ -412,7 +429,7 @@ wss.on("connection", ws => {
       const kind = String(p.kind || "");
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state", "spotify-command", "spotify-request"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
 
@@ -441,6 +458,18 @@ wss.on("connection", ws => {
 
       const profile = sanitizeProfile(p);
       if (kind === "profile" || kind === "presence" || kind === "chat" || kind === "sticker") s.profile = profile;
+
+      if (kind === "spotify-command") {
+        const cached = {
+          ...p,
+          kind: "spotify-command",
+          authoritative: p.authoritative === true,
+          senderId: p.senderId || s.clientId || s.id,
+          authorityId: p.authorityId || p.senderId || s.clientId || s.id,
+          sentAt: Number(p.sentAt || Date.now())
+        };
+        roomPlaybackState.set(s.room, cached);
+      }
 
       broadcast(s.room, {
         type: "message",
@@ -478,6 +507,7 @@ setInterval(() => {
       if ((!rooms.get(room) || rooms.get(room).size === 0) && roomTargets.has(room)) {
         rooms.delete(room);
         roomTargets.delete(room);
+        roomPlaybackState.delete(room);
       }
     }
   }
