@@ -12,6 +12,10 @@ const roomTargets = new Map();
 const clients = new Map();
 const clientSockets = new Map();
 const navigationTransitions = new Map();
+// Latest authoritative Spotify state per room, so a late joiner gets the
+// active track/position instantly on connect instead of waiting up to one
+// heartbeat interval (see spotify.js's HEARTBEAT_MS) for the next broadcast.
+const roomSpotifyState = new Map();
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
@@ -245,6 +249,7 @@ function cleanupTransitionParticipant(room, clientId) {
     navigationTransitions.delete(room);
     rooms.delete(room);
     roomTargets.delete(room);
+    roomSpotifyState.delete(room);
   }
 }
 function maybeReleaseTransition(room) {
@@ -338,6 +343,7 @@ function detachSocket(ws, announce = true, removeClient = true) {
       rooms.delete(room);
       roomTargets.delete(room);
       navigationTransitions.delete(room);
+      roomSpotifyState.delete(room);
     }
   }
   if (s.clientId && clientSockets.get(s.clientId) === ws) clientSockets.delete(s.clientId);
@@ -397,6 +403,8 @@ wss.on("connection", ws => {
 
       send(ws, { type: "you", id: s.id, clientId: s.clientId });
       send(ws, { type: "room-info", room, targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
+      const cachedSpotify = roomSpotifyState.get(room);
+      if (cachedSpotify) send(ws, { type: "message", payload: cachedSpotify });
       if (existingTransition) sendTransitionState(ws, existingTransition);
       broadcastPeers(room);
       // During an active navigation handoff, presence is continuous: do not emit
@@ -412,7 +420,15 @@ wss.on("connection", ws => {
       const kind = String(p.kind || "");
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state",
+        // Spotify state is room-wide by design: track identity travels in the
+        // payload itself (trackId/trackUrl), not in the page URL, and a
+        // user's Spotify pageKey drifts constantly just from browsing
+        // Home/Search/Playlists while a track keeps playing. Gating these on
+        // pageKey equality — a check meant for "same page = same video" on
+        // video sites — silently dropped nearly every command as soon as
+        // either peer's Spotify page differed from whatever it was at join.
+        "spotify-command", "spotify-request"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
 
@@ -442,18 +458,25 @@ wss.on("connection", ws => {
       const profile = sanitizeProfile(p);
       if (kind === "profile" || kind === "presence" || kind === "chat" || kind === "sticker") s.profile = profile;
 
-      broadcast(s.room, {
-        type: "message",
-        payload: {
-          ...p,
-          transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
-          url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
-          id: p.id || s.id,
-          name: profile.name,
-          avatar: profile.avatar,
-          color: profile.color
-        }
-      }, ws);
+      const outgoingPayload = {
+        ...p,
+        transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
+        url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
+        id: p.id || s.id,
+        name: profile.name,
+        avatar: profile.avatar,
+        color: profile.color
+      };
+
+      // Only genuine authoritative commands are worth caching — a
+      // "spotify-request" is just a non-authority's proposal and hasn't been
+      // arbitrated yet, so replaying one to a late joiner would apply
+      // unconfirmed state instead of whatever the room actually settled on.
+      if (kind === "spotify-command" && outgoingPayload.authoritative === true) {
+        roomSpotifyState.set(s.room, outgoingPayload);
+      }
+
+      broadcast(s.room, { type: "message", payload: outgoingPayload }, ws);
 
       if (kind === "profile" || kind === "presence") broadcastPeers(s.room);
       return;
@@ -478,6 +501,7 @@ setInterval(() => {
       if ((!rooms.get(room) || rooms.get(room).size === 0) && roomTargets.has(room)) {
         rooms.delete(room);
         roomTargets.delete(room);
+        roomSpotifyState.delete(room);
       }
     }
   }
