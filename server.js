@@ -12,6 +12,10 @@ const roomTargets = new Map();
 const clients = new Map();
 const clientSockets = new Map();
 const navigationTransitions = new Map();
+// Latest authoritative spotify-command payload per room, so a late-joining
+// participant is caught up on the active track/position immediately on
+// connect instead of waiting for the next host heartbeat (~1s) or command.
+const roomSpotifyState = new Map();
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
@@ -245,6 +249,7 @@ function cleanupTransitionParticipant(room, clientId) {
     navigationTransitions.delete(room);
     rooms.delete(room);
     roomTargets.delete(room);
+    roomSpotifyState.delete(room);
   }
 }
 function maybeReleaseTransition(room) {
@@ -338,6 +343,7 @@ function detachSocket(ws, announce = true, removeClient = true) {
       rooms.delete(room);
       roomTargets.delete(room);
       navigationTransitions.delete(room);
+      roomSpotifyState.delete(room);
     }
   }
   if (s.clientId && clientSockets.get(s.clientId) === ws) clientSockets.delete(s.clientId);
@@ -398,6 +404,8 @@ wss.on("connection", ws => {
       send(ws, { type: "you", id: s.id, clientId: s.clientId });
       send(ws, { type: "room-info", room, targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
       if (existingTransition) sendTransitionState(ws, existingTransition);
+      const cachedSpotifyState = roomSpotifyState.get(room);
+      if (cachedSpotifyState) send(ws, { type: "message", payload: cachedSpotifyState });
       broadcastPeers(room);
       // During an active navigation handoff, presence is continuous: do not emit
       // a generic joined-party chat line for a reconnecting/newly arrived socket.
@@ -412,7 +420,18 @@ wss.on("connection", ws => {
       const kind = String(p.kind || "");
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state",
+        // Spotify commands/requests must be room-wide, not gated by pageKey.
+        // open.spotify.com's URL path changes on every track (/track/<id>),
+        // so p.pageKey (computed fresh at send time from the sender's
+        // current URL) would almost never match s.pageKey (frozen at the
+        // sender's own last join/navigate, and Spotify never sends
+        // "navigate" packets — see isSpotifyPlatform() in navigation.js).
+        // That mismatch was silently dropping every track-change packet
+        // before it ever reached broadcast(), which is why play/pause
+        // occasionally got through (pageKey hadn't moved yet) but track
+        // switches never did.
+        "spotify-command", "spotify-request"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
 
@@ -442,18 +461,24 @@ wss.on("connection", ws => {
       const profile = sanitizeProfile(p);
       if (kind === "profile" || kind === "presence" || kind === "chat" || kind === "sticker") s.profile = profile;
 
-      broadcast(s.room, {
-        type: "message",
-        payload: {
-          ...p,
-          transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
-          url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
-          id: p.id || s.id,
-          name: profile.name,
-          avatar: profile.avatar,
-          color: profile.color
-        }
-      }, ws);
+      const outgoingPayload = {
+        ...p,
+        transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
+        url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
+        id: p.id || s.id,
+        name: profile.name,
+        avatar: profile.avatar,
+        color: profile.color
+      };
+
+      broadcast(s.room, { type: "message", payload: outgoingPayload }, ws);
+
+      // Keep the room's Spotify cache current so future late-joiners get the
+      // right track/position. Only authoritative commands qualify — a bare
+      // "spotify-request" from a non-host is not yet a confirmed room state.
+      if (kind === "spotify-command" && outgoingPayload.authoritative === true) {
+        roomSpotifyState.set(s.room, outgoingPayload);
+      }
 
       if (kind === "profile" || kind === "presence") broadcastPeers(s.room);
       return;
@@ -478,6 +503,7 @@ setInterval(() => {
       if ((!rooms.get(room) || rooms.get(room).size === 0) && roomTargets.has(room)) {
         rooms.delete(room);
         roomTargets.delete(room);
+        roomSpotifyState.delete(room);
       }
     }
   }
