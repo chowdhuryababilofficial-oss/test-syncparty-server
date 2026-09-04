@@ -21,6 +21,7 @@ function rowToEntry(row) {
     contentType: row.content_type || row.kind,
     thumbnail: row.thumbnail,
     artwork: row.artwork || row.thumbnail || null,
+    artworkCandidates: Array.isArray(row.artwork_candidates) ? row.artwork_candidates : [],
     canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
     season: row.season == null ? null : Number(row.season),
@@ -28,6 +29,9 @@ function rowToEntry(row) {
     progress: Number(row.progress || 0),
     status: row.status,
     watchDurationSec: Number(row.watch_duration_sec || 0),
+    togetherDurationSec: Number(row.together_duration_sec || 0),
+    sessionCount: Number(row.session_count || 0),
+    completedAt: row.completed_at == null ? null : Number(row.completed_at),
     firstWatchedAt: Number(row.first_watched_at || 0),
     lastWatchedAt: Number(row.last_watched_at || 0),
     createdAt: Number(row.created_at || 0),
@@ -44,6 +48,9 @@ function normalizeEntry(entry, existing = null) {
     content_type: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
     canonical_title: String(entry.canonicalTitle || existing?.canonical_title || entry.title || existing?.title || "Untitled").slice(0,240),
     artwork: entry.artwork ? String(entry.artwork).slice(0,2000) : (existing?.artwork || null),
+    artwork_candidates: Array.isArray(entry.artworkCandidates) && entry.artworkCandidates.length
+      ? entry.artworkCandidates.slice(0,8).map(u => String(u).slice(0,2000))
+      : (existing?.artwork_candidates || []),
     thumbnail: entry.thumbnail ? String(entry.thumbnail).slice(0, 2000) : (existing?.thumbnail || null),
     platform: String(entry.platform || existing?.platform || "").slice(0, 80),
     season: Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
@@ -53,6 +60,16 @@ function normalizeEntry(entry, existing = null) {
     watch_duration_sec: existing
       ? Math.max(0, Number(existing.watch_duration_sec || 0) + (Number(entry.watchDurationDeltaSec) || 0))
       : Math.max(0, Number(entry.watchDurationDeltaSec) || Number(entry.watchDurationSec) || 0),
+    // Same delta-accumulation pattern as watch_duration_sec, kept as an
+    // entirely separate column — see sampleTogether() in
+    // scrapbook-collector.js for exactly what this counts.
+    together_duration_sec: existing
+      ? Math.max(0, Number(existing.together_duration_sec || 0) + (Number(entry.togetherDurationDeltaSec) || 0))
+      : Math.max(0, Number(entry.togetherDurationDeltaSec) || Number(entry.togetherDurationSec) || 0),
+    session_count: Math.max(0, Number(existing?.session_count || 0) + (Number(entry.sessionCountDelta) || 0)) || 1,
+    // Earliest non-null wins — a later re-watch reaching 'completed' again
+    // must not overwrite the original completion date.
+    completed_at: existing?.completed_at != null ? existing.completed_at : (Number.isFinite(Number(entry.completedAt)) ? Number(entry.completedAt) : null),
     first_watched_at: Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t),
     last_watched_at: Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t),
     updated_at: t

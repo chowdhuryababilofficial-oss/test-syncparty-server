@@ -158,3 +158,15 @@ update public.scrapbook_entries set canonical_title = title where canonical_titl
 alter table public.scrapbook_entries alter column content_type set default 'movie';
 alter table public.scrapbook_entries alter column content_type set not null;
 alter table public.scrapbook_entries add constraint scrapbook_entries_content_type_check check (content_type in ('movie','series','anime'));
+
+-- Cinematic Memory migration: journey/insight fields, additive only.
+-- together_duration_sec is intentionally a separate column from
+-- watch_duration_sec, never derived from it — see sampleTogether() in
+-- scrapbook-collector.js for exactly what it counts.
+alter table public.scrapbook_entries add column if not exists together_duration_sec bigint not null default 0 check (together_duration_sec >= 0);
+alter table public.scrapbook_entries add column if not exists session_count integer not null default 0 check (session_count >= 0);
+alter table public.scrapbook_entries add column if not exists completed_at bigint;
+alter table public.scrapbook_entries add column if not exists artwork_candidates jsonb not null default '[]'::jsonb;
+-- Existing rows predate session counting; treat each as at least one
+-- known session rather than leaving a misleading 0.
+update public.scrapbook_entries set session_count = 1 where session_count = 0;
