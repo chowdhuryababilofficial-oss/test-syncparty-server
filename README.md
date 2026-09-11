@@ -32,3 +32,9 @@ The Supabase service-role/secret key must never be placed in the Chrome extensio
 Set the same Supabase environment variables locally, then run `npm install` and `npm start`.
 
 The previous file-backed store is no longer used. This package does not automatically import an old JSON database; migrate legacy data separately before deleting the old file if you still have it.
+
+### Scrapbook metadata intelligence
+
+The Scrapbook uses a conservative local classifier first, then optionally asks the SyncParty server to resolve plausible movie/series/anime identities through TMDB. Store the TMDB API v4 bearer token only on Render as `TMDB_API_TOKEN`; never put it in the extension. The resolver is cached in server memory and falls back safely if TMDB is unavailable.
+
+The TMDB developer API is free for non-commercial use with required attribution; commercial use requires contacting TMDB for licensing. The application attribution is shown in the Scrapbook Account/Credits area.

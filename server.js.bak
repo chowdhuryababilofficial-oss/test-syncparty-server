@@ -2,7 +2,6 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
-const metadataResolver = require("./metadata-resolver");
 const port = Number(process.env.PORT || 8787);
 
 // One live WebSocket per stable clientId. A browser tab keeps clientId in
@@ -90,16 +89,6 @@ const httpServer = http.createServer(async (req, res) => {
       }
       const session=await createSession(user.id);
       json(res,200,{ok:true,token:session,user:publicUser(user)}); return;
-    }
-
-    if (path === "/api/scrapbook/resolve" && req.method === "POST") {
-      const b = await readJson(req);
-      const meta = b.meta && typeof b.meta === "object" ? b.meta : {};
-      const provisional = b.provisional && typeof b.provisional === "object" ? b.provisional : {};
-      if (!process.env.TMDB_API_TOKEN) { json(res,503,{ok:false,error:"Metadata resolver is not configured."}); return; }
-      const resolved = await metadataResolver.resolve({ meta, provisional });
-      json(res,200,{ok:true,metadata:resolved});
-      return;
     }
 
     if (path === "/api/scrapbook" && req.method === "GET") {

@@ -17,3 +17,5 @@ services:
         sync: false
       - key: GOOGLE_CLIENT_SECRET
         sync: false
+      - key: TMDB_API_TOKEN
+        sync: false

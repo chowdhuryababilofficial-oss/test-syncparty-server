@@ -80,26 +80,13 @@ create table if not exists public.scrapbook_entries (
   content_type text not null default 'movie' check (content_type in ('movie','series','anime')),
   canonical_title text,
   artwork text,
-  artwork_candidates jsonb not null default '[]'::jsonb,
-  backdrop text,
   thumbnail text,
-  metadata_provider text not null default '',
-  metadata_id text not null default '',
-  metadata_year integer,
   platform text not null default '',
   season integer,
   episode integer,
-  story_total_episodes integer not null default 0,
-  story_episodes_completed integer not null default 0,
-  story_progress numeric(5,4),
-  story_progress_confidence numeric(5,4),
-  series_episode_counts jsonb,
   progress numeric(5,4) not null default 0 check (progress >= 0 and progress <= 1),
   status text not null check (status in ('completed','watching','paused')),
   watch_duration_sec bigint not null default 0 check (watch_duration_sec >= 0),
-  together_duration_sec bigint not null default 0 check (together_duration_sec >= 0),
-  session_count integer not null default 0 check (session_count >= 0),
-  completed_at bigint,
   first_watched_at bigint not null,
   last_watched_at bigint not null,
   created_at bigint not null,
@@ -180,15 +167,6 @@ alter table public.scrapbook_entries add column if not exists together_duration_
 alter table public.scrapbook_entries add column if not exists session_count integer not null default 0 check (session_count >= 0);
 alter table public.scrapbook_entries add column if not exists completed_at bigint;
 alter table public.scrapbook_entries add column if not exists artwork_candidates jsonb not null default '[]'::jsonb;
-alter table public.scrapbook_entries add column if not exists backdrop text;
-alter table public.scrapbook_entries add column if not exists metadata_provider text not null default '';
-alter table public.scrapbook_entries add column if not exists metadata_id text not null default '';
-alter table public.scrapbook_entries add column if not exists metadata_year integer;
-alter table public.scrapbook_entries add column if not exists story_total_episodes integer not null default 0;
-alter table public.scrapbook_entries add column if not exists story_episodes_completed integer not null default 0;
-alter table public.scrapbook_entries add column if not exists story_progress numeric(5,4);
-alter table public.scrapbook_entries add column if not exists story_progress_confidence numeric(5,4);
-alter table public.scrapbook_entries add column if not exists series_episode_counts jsonb;
 -- Existing rows predate session counting; treat each as at least one
 -- known session rather than leaving a misleading 0.
 update public.scrapbook_entries set session_count = 1 where session_count = 0;

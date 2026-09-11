@@ -21,7 +21,6 @@ function rowToEntry(row) {
     contentType: row.content_type || row.kind,
     thumbnail: row.thumbnail,
     artwork: row.artwork || row.thumbnail || null,
-    backdrop: row.backdrop || null,
     artworkCandidates: Array.isArray(row.artwork_candidates) ? row.artwork_candidates : [],
     canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
@@ -33,14 +32,6 @@ function rowToEntry(row) {
     togetherDurationSec: Number(row.together_duration_sec || 0),
     sessionCount: Number(row.session_count || 0),
     completedAt: row.completed_at == null ? null : Number(row.completed_at),
-    metadataProvider: row.metadata_provider || "",
-    metadataId: row.metadata_id || "",
-    metadataYear: row.metadata_year == null ? null : Number(row.metadata_year),
-    storyTotalEpisodes: Number(row.story_total_episodes || 0),
-    storyEpisodesCompleted: Number(row.story_episodes_completed || 0),
-    storyProgress: row.story_progress == null ? null : Number(row.story_progress),
-    storyProgressConfidence: row.story_progress_confidence == null ? null : Number(row.story_progress_confidence),
-    seriesEpisodeCounts: row.series_episode_counts && typeof row.series_episode_counts === "object" ? row.series_episode_counts : null,
     firstWatchedAt: Number(row.first_watched_at || 0),
     lastWatchedAt: Number(row.last_watched_at || 0),
     createdAt: Number(row.created_at || 0),
@@ -57,7 +48,6 @@ function normalizeEntry(entry, existing = null) {
     content_type: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
     canonical_title: String(entry.canonicalTitle || existing?.canonical_title || entry.title || existing?.title || "Untitled").slice(0,240),
     artwork: entry.artwork ? String(entry.artwork).slice(0,2000) : (existing?.artwork || null),
-    backdrop: entry.backdrop ? String(entry.backdrop).slice(0,2000) : (existing?.backdrop || null),
     artwork_candidates: Array.isArray(entry.artworkCandidates) && entry.artworkCandidates.length
       ? entry.artworkCandidates.slice(0,8).map(u => String(u).slice(0,2000))
       : (existing?.artwork_candidates || []),
@@ -80,14 +70,6 @@ function normalizeEntry(entry, existing = null) {
     // Earliest non-null wins — a later re-watch reaching 'completed' again
     // must not overwrite the original completion date.
     completed_at: existing?.completed_at != null ? existing.completed_at : (Number.isFinite(Number(entry.completedAt)) ? Number(entry.completedAt) : null),
-    metadata_provider: String(entry.metadataProvider || existing?.metadata_provider || "").slice(0,40),
-    metadata_id: String(entry.metadataId || existing?.metadata_id || "").slice(0,80),
-    metadata_year: Number.isFinite(Number(entry.metadataYear)) ? Number(entry.metadataYear) : (existing?.metadata_year ?? null),
-    story_total_episodes: Math.max(0, Number(entry.storyTotalEpisodes) || Number(existing?.story_total_episodes || 0)),
-    story_episodes_completed: Math.max(0, Number(entry.storyEpisodesCompleted) || Number(existing?.story_episodes_completed || 0)),
-    story_progress: entry.storyProgress == null ? (existing?.story_progress ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgress))),
-    story_progress_confidence: entry.storyProgressConfidence == null ? (existing?.story_progress_confidence ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgressConfidence))),
-    series_episode_counts: entry.seriesEpisodeCounts && typeof entry.seriesEpisodeCounts === "object" ? entry.seriesEpisodeCounts : (existing?.series_episode_counts || null),
     first_watched_at: Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t),
     last_watched_at: Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t),
     updated_at: t
@@ -200,7 +182,7 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // An existing deployment may not yet have the optional artwork/title columns.
     // Retry only the legacy-compatible fields; anime still correctly requires the
     // existing kind/content_type constraint to permit it.
-    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    const modernSchemaError = /column .*?(content_type|canonical_title|artwork).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
       const legacyRow = { ...row };
       delete legacyRow.content_type;
