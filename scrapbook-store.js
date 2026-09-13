@@ -202,10 +202,33 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // existing kind/content_type constraint to permit it.
     const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
+      // Every column named in the regex above must be stripped here too —
+      // this list previously only dropped the original three (content_type/
+      // canonical_title/artwork) even after the regex was widened to cover
+      // all the newer optional columns added since. On any deployment still
+      // missing one of those newer columns, the retry below re-inserted the
+      // very same offending column and failed with the identical error,
+      // which is why brand-new rows (e.g. every entry in a guest → account
+      // history migration, which is all first-time inserts) surfaced as a
+      // generic "SyncParty server error." Existing rows were unaffected
+      // since they go through the UPDATE branch above, not this one.
       const legacyRow = { ...row };
       delete legacyRow.content_type;
       delete legacyRow.canonical_title;
       delete legacyRow.artwork;
+      delete legacyRow.artwork_candidates;
+      delete legacyRow.backdrop;
+      delete legacyRow.metadata_provider;
+      delete legacyRow.metadata_id;
+      delete legacyRow.metadata_year;
+      delete legacyRow.story_total_episodes;
+      delete legacyRow.story_episodes_completed;
+      delete legacyRow.story_progress;
+      delete legacyRow.story_progress_confidence;
+      delete legacyRow.series_episode_counts;
+      delete legacyRow.together_duration_sec;
+      delete legacyRow.session_count;
+      delete legacyRow.completed_at;
       const legacy = await sb.from("scrapbook_entries").insert(legacyRow).select("*").maybeSingle();
       if (!legacy.error) return rowToEntry(legacy.data);
       error = legacy.error;
