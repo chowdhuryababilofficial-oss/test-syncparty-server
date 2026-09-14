@@ -43,21 +43,12 @@ create table if not exists public.relations (
   user2_id text not null references public.users(id) on delete cascade,
   created_at bigint not null,
   accepted_at bigint,
-  ended_at bigint,
   constraint relations_distinct_users check (user1_id <> user2_id),
   constraint relations_sorted_users check (user1_id < user2_id)
 );
 
-create unique index if not exists relations_active_pair_uidx
-  on public.relations(user1_id,user2_id)
-  where accepted_at is not null and ended_at is null;
-create unique index if not exists relations_one_active_user1_uidx
-  on public.relations(user1_id)
-  where accepted_at is not null and ended_at is null;
-
-create unique index if not exists relations_one_active_user2_uidx
-  on public.relations(user2_id)
-  where accepted_at is not null and ended_at is null;
+create unique index if not exists relations_pair_uidx
+  on public.relations(user1_id,user2_id);
 
 create table if not exists public.invites (
   id text primary key,
@@ -201,26 +192,3 @@ alter table public.scrapbook_entries add column if not exists series_episode_cou
 -- Existing rows predate session counting; treat each as at least one
 -- known session rather than leaving a misleading 0.
 update public.scrapbook_entries set session_count = 1 where session_count = 0;
-
--- Our Story relationship lifecycle migration (additive).
--- An ended relation is archived, never deleted, so shared memories remain intact.
-alter table public.relations add column if not exists ended_at bigint;
-create unique index if not exists relations_one_active_user1_uidx
-  on public.relations(user1_id)
-  where accepted_at is not null and ended_at is null;
-create unique index if not exists relations_one_active_user2_uidx
-  on public.relations(user2_id)
-  where accepted_at is not null and ended_at is null;
-
--- Relationship history migration: allow multiple archived stories with the same
--- person while enforcing at most one active relation for a pair/user.
-drop index if exists public.relations_pair_uidx;
-create unique index if not exists relations_active_pair_uidx
-  on public.relations(user1_id,user2_id)
-  where accepted_at is not null and ended_at is null;
-create unique index if not exists relations_one_active_user1_uidx
-  on public.relations(user1_id)
-  where accepted_at is not null and ended_at is null;
-create unique index if not exists relations_one_active_user2_uidx
-  on public.relations(user2_id)
-  where accepted_at is not null and ended_at is null;

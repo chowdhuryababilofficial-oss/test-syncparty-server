@@ -107,11 +107,8 @@ async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,ended_at")
-    .eq("user1_id", ids[0]).eq("user2_id", ids[1])
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .select("id,user1_id,user2_id,created_at,accepted_at")
+    .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
   if (error) throw error;
   return data || null;
 }
@@ -123,30 +120,14 @@ async function relationView(r) {
     id: r.id,
     users: [publicUser(a), publicUser(b)],
     createdAt: Number(r.created_at || 0),
-    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at),
-    endedAt: r.ended_at == null ? null : Number(r.ended_at),
-    active: r.accepted_at != null && r.ended_at == null
+    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at)
   };
-}
-
-async function getActiveRelation(userId) {
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,ended_at")
-    .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
-    .not("accepted_at", "is", null)
-    .is("ended_at", null)
-    .order("accepted_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (error) throw error;
-  return data || null;
 }
 
 async function listUserRelations(userId) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,ended_at")
+    .select("id,user1_id,user2_id,created_at,accepted_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
   if (error) throw error;
@@ -221,10 +202,33 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // existing kind/content_type constraint to permit it.
     const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
+      // Every column named in the regex above must be stripped here too —
+      // this list previously only dropped the original three (content_type/
+      // canonical_title/artwork) even after the regex was widened to cover
+      // all the newer optional columns added since. On any deployment still
+      // missing one of those newer columns, the retry below re-inserted the
+      // very same offending column and failed with the identical error,
+      // which is why brand-new rows (e.g. every entry in a guest → account
+      // history migration, which is all first-time inserts) surfaced as a
+      // generic "SyncParty server error." Existing rows were unaffected
+      // since they go through the UPDATE branch above, not this one.
       const legacyRow = { ...row };
       delete legacyRow.content_type;
       delete legacyRow.canonical_title;
       delete legacyRow.artwork;
+      delete legacyRow.artwork_candidates;
+      delete legacyRow.backdrop;
+      delete legacyRow.metadata_provider;
+      delete legacyRow.metadata_id;
+      delete legacyRow.metadata_year;
+      delete legacyRow.story_total_episodes;
+      delete legacyRow.story_episodes_completed;
+      delete legacyRow.story_progress;
+      delete legacyRow.story_progress_confidence;
+      delete legacyRow.series_episode_counts;
+      delete legacyRow.together_duration_sec;
+      delete legacyRow.session_count;
+      delete legacyRow.completed_at;
       const legacy = await sb.from("scrapbook_entries").insert(legacyRow).select("*").maybeSingle();
       if (!legacy.error) return rowToEntry(legacy.data);
       error = legacy.error;
@@ -236,30 +240,15 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
 
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
-  if (String(fromUserId) === String(toUserId)) return { error: "Choose a different SyncParty user." };
-  const [fromActive, toActive, relation] = await Promise.all([
-    getActiveRelation(fromUserId),
-    getActiveRelation(toUserId),
-    getRelation(fromUserId, toUserId)
-  ]);
-  if (fromActive) return { error: "You already have an active Our Story." };
-  if (toActive) return { error: "That user already has an active Our Story." };
-  if (relation?.accepted_at && relation?.ended_at == null) return { relation: await relationView(relation) };
+  const relation = await getRelation(fromUserId, toUserId);
+  if (relation?.accepted_at) return { relation: await relationView(relation) };
   const { data: existing, error: findError } = await sb.from("invites")
     .select("*").eq("from_user_id", fromUserId).eq("to_user_id", toUserId).eq("status", "pending").maybeSingle();
   if (findError) throw findError;
   if (existing) return { invite: rowToInvite(existing) };
   const invite = { id: id("invite"), from_user_id: fromUserId, to_user_id: toUserId, status: "pending", created_at: now(), responded_at: null };
   const { data, error } = await sb.from("invites").insert(invite).select("*").maybeSingle();
-  if (error) {
-    if (error.code === "23505") {
-      const [freshFrom, freshTo] = await Promise.all([getActiveRelation(fromUserId), getActiveRelation(toUserId)]);
-      if (freshFrom || freshTo) return { error: "One of you already has an active Our Story." };
-      const { data: retry } = await sb.from("invites").select("*").eq("from_user_id", fromUserId).eq("to_user_id", toUserId).eq("status", "pending").maybeSingle();
-      if (retry) return { invite: rowToInvite(retry) };
-    }
-    throw error;
-  }
+  if (error) throw error;
   return { invite: rowToInvite(data) };
 }
 
@@ -295,64 +284,25 @@ async function respondInvite(inviteId, userId, accept) {
   if (findError) throw findError;
   if (!inv) return { error: "Invitation no longer exists." };
   const respondedAt = now();
-  if (!accept) {
-    const { error: updateError } = await sb.from("invites").update({ status: "declined", responded_at: respondedAt }).eq("id", inviteId).eq("status", "pending");
-    if (updateError) throw updateError;
-    return { relation: null };
-  }
-  const [fromActive, toActive] = await Promise.all([getActiveRelation(inv.from_user_id), getActiveRelation(inv.to_user_id)]);
-  if (fromActive || toActive) return { error: "One of you already has an active Our Story." };
+  const { error: updateError } = await sb.from("invites").update({ status: accept ? "accepted" : "declined", responded_at: respondedAt }).eq("id", inviteId);
+  if (updateError) throw updateError;
+  if (!accept) return { relation: null };
   const ids = [inv.from_user_id, inv.to_user_id].sort();
   const existing = await getRelation(inv.from_user_id, inv.to_user_id);
   let relation = existing;
   if (!relation) {
-    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt, ended_at: null };
+    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt };
     const { data, error } = await sb.from("relations").insert(row).select("*").maybeSingle();
     if (error) {
-      if (error.code === "23505") {
-        const [freshFrom, freshTo] = await Promise.all([getActiveRelation(inv.from_user_id), getActiveRelation(inv.to_user_id)]);
-        if (freshFrom || freshTo) return { error: "One of you already has an active Our Story." };
-        relation = await getRelation(inv.from_user_id, inv.to_user_id);
-        if (!relation || relation.ended_at != null) return { error: "This invitation can no longer be accepted." };
-      } else throw error;
+      if (error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id);
+      else throw error;
     } else relation = data;
-  } else if (relation.accepted_at && relation.ended_at == null) {
-    return { relation: await relationView(relation) };
-  } else {
-    relation = null;
-    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt, ended_at: null };
-    const { data, error } = await sb.from("relations").insert(row).select("*").maybeSingle();
-    if (error) {
-      if (error.code === "23505") return { error: "One of you already has an active Our Story." };
-      throw error;
-    }
+  } else if (!relation.accepted_at) {
+    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
+    if (error) throw error;
     relation = data;
   }
-  const { error: updateError } = await sb.from("invites").update({ status: "accepted", responded_at: respondedAt }).eq("id", inviteId).eq("status", "pending");
-  if (updateError) throw updateError;
   return { relation: await relationView(relation) };
-}
-
-async function endRelation(relationId, userId) {
-  const sb = getSupabaseAdmin();
-  const { data: relation, error: findError } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,ended_at")
-    .eq("id", relationId)
-    .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
-    .maybeSingle();
-  if (findError) throw findError;
-  if (!relation) return { error: "Our Story was not found." };
-  if (!relation.accepted_at) return { error: "This Our Story is not active." };
-  if (relation.ended_at != null) return { relation: await relationView(relation) };
-  const endedAt = now();
-  const { data, error } = await sb.from("relations")
-    .update({ ended_at: endedAt })
-    .eq("id", relationId)
-    .is("ended_at", null)
-    .select("*")
-    .maybeSingle();
-  if (error) throw error;
-  return { relation: await relationView(data || { ...relation, ended_at: endedAt }) };
 }
 
 async function getHighlights(userId) {
@@ -371,7 +321,6 @@ module.exports = {
   now,
   getUser,
   getRelation,
-  getActiveRelation,
   relationView,
   listUserRelations,
   listPersonalEntries,
@@ -380,7 +329,6 @@ module.exports = {
   createInvite,
   listInvites,
   respondInvite,
-  endRelation,
   getHighlights,
   rowToInvite
 };
