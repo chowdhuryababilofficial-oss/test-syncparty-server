@@ -14,8 +14,6 @@ function rowToEntry(row) {
     id: row.id,
     userId: row.user_id,
     scope: row.scope,
-    archivedAt: row.archived_at == null ? null : Number(row.archived_at),
-    removedAt: row.removed_at == null ? null : Number(row.removed_at),
     relationId: row.relation_id,
     sourceKey: row.source_key,
     title: row.title,
@@ -46,7 +44,8 @@ function rowToEntry(row) {
     firstWatchedAt: Number(row.first_watched_at || 0),
     lastWatchedAt: Number(row.last_watched_at || 0),
     createdAt: Number(row.created_at || 0),
-    updatedAt: Number(row.updated_at || 0)
+    updatedAt: Number(row.updated_at || 0),
+    archivedAt: row.archived_at == null ? null : Number(row.archived_at)
   };
 }
 
@@ -98,26 +97,29 @@ function normalizeEntry(entry, existing = null) {
 
 async function getUser(userId) {
   const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("users").select("*").eq("id", userId).maybeSingle();
+  let { data, error } = await sb.from("users").select("id,name,email,avatar,color,provider,party_name,party_avatar").eq("id", userId).maybeSingle();
+  if (error && /column .*?(party_name|party_avatar).*?(does not exist|unknown)/i.test(String(error.message || ""))) {
+    const legacy = await sb.from("users").select("id,name,email,avatar,color,provider").eq("id", userId).maybeSingle();
+    data = legacy.data; error = legacy.error;
+  }
   if (error) throw error;
   return data ? {
-    id: data.id, name: data.name, displayName: data.display_name || null, email: data.email, avatar: data.avatar, partyAvatar: data.party_avatar || null, color: data.color, provider: data.provider
+    id: data.id, name: data.name, email: data.email, avatar: data.avatar, color: data.color, provider: data.provider
   } : null;
 }
 
 async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
+  let { data, error } = await sb.from("relations")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
     .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-  if (!error) return data || null;
-  if (isMissingColumnError(error, "archived_at")) {
-    const retry = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at").eq("user1_id",ids[0]).eq("user2_id",ids[1]).maybeSingle();
-    if (retry.error) throw retry.error;
-    return retry.data || null;
+  if (error && /column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
+    const legacy = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at,archived_at").eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
+    data = legacy.data; error = legacy.error;
   }
-  throw error;
+  if (error) throw error;
+  return data || null;
 }
 
 async function relationView(r) {
@@ -128,7 +130,8 @@ async function relationView(r) {
     users: [publicUser(a), publicUser(b)],
     createdAt: Number(r.created_at || 0),
     acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at),
-    archivedAt: r.archived_at == null ? null : Number(r.archived_at)
+    archivedAt: r.archived_at == null ? null : Number(r.archived_at),
+    endedAt: r.ended_at == null ? null : Number(r.ended_at)
   };
 }
 
@@ -141,7 +144,7 @@ function isMissingColumnError(error, col) {
 async function getActiveRelationForUser(userId) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .not("accepted_at", "is", null)
     .is("archived_at", null)
@@ -169,20 +172,19 @@ async function getActiveRelationForUser(userId) {
 
 async function listUserRelations(userId) {
   const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
+  let { data, error } = await sb.from("relations")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
-  if (!error) return Promise.all((data || []).map(relationView));
-  if (isMissingColumnError(error, "archived_at")) {
-    const retry = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at").or(`user1_id.eq.${userId},user2_id.eq.${userId}`).order("created_at", { ascending:false });
-    if (retry.error) throw retry.error;
-    return Promise.all((retry.data || []).map(relationView));
+  if (error && /column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
+    const legacy = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at,archived_at").or(`user1_id.eq.${userId},user2_id.eq.${userId}`).order("created_at", { ascending: false });
+    data = legacy.data; error = legacy.error;
   }
-  throw error;
+  if (error) throw error;
+  return Promise.all((data || []).map(relationView));
 }
 
-async function listPersonalEntries(userId, limit = 150, includeArchived = false) {
+async function listPersonalEntries(userId, limit = 150, includeArchived = true) {
   const sb = getSupabaseAdmin();
   let q = sb.from("scrapbook_entries")
     .select("*")
@@ -192,18 +194,11 @@ async function listPersonalEntries(userId, limit = 150, includeArchived = false)
     .limit(limit);
   if (!includeArchived) q = q.is("archived_at", null);
   const { data, error } = await q;
-  if (error) {
-    if (isMissingColumnError(error, "archived_at")) {
-      const legacy = await sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", "personal").order("last_watched_at", { ascending: false }).limit(limit);
-      if (legacy.error) throw legacy.error;
-      return (legacy.data || []).map(rowToEntry);
-    }
-    throw error;
-  }
+  if (error) throw error;
   return (data || []).map(rowToEntry);
 }
 
-async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = false) {
+async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = true) {
   const sb = getSupabaseAdmin();
   let q = sb.from("scrapbook_entries")
     .select("*")
@@ -214,16 +209,7 @@ async function listSharedEntries(userId, relationId = null, limit = 150, include
   if (relationId) q = q.eq("relation_id", relationId);
   if (!includeArchived) q = q.is("archived_at", null);
   const { data, error } = await q;
-  if (error) {
-    if (isMissingColumnError(error, "archived_at")) {
-      let legacy = sb.from("scrapbook_entries").select("*").eq("user_id", userId).like("scope", "shared:%").order("last_watched_at", { ascending: false }).limit(limit);
-      if (relationId) legacy = legacy.eq("relation_id", relationId);
-      const retry = await legacy;
-      if (retry.error) throw retry.error;
-      return (retry.data || []).map(rowToEntry);
-    }
-    throw error;
-  }
+  if (error) throw error;
   return (data || []).map(rowToEntry);
 }
 
@@ -305,30 +291,45 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
   return rowToEntry(data);
 }
 
-async function setEntryArchive(userId, entryId, archived) {
+async function mutateEntries(userId, entryIds, mode, archived = true) {
+  const ids = Array.isArray(entryIds) ? entryIds.map(String).filter(Boolean).slice(0, 100) : [];
+  if (!ids.length) return { entries: [] };
   const sb = getSupabaseAdmin();
+  if (mode === "remove") {
+    const { data, error } = await sb.from("scrapbook_entries").delete().eq("user_id", userId).in("id", ids).select("id");
+    if (error) throw error;
+    return { entries: data || [] };
+  }
   const patch = { archived_at: archived ? now() : null };
-  const { data, error } = await sb.from("scrapbook_entries").update(patch).eq("id", entryId).eq("user_id", userId).select("*").maybeSingle();
+  const { data, error } = await sb.from("scrapbook_entries").update(patch).eq("user_id", userId).in("id", ids).select("*");
   if (error) {
-    if (isMissingColumnError(error, "archived_at")) return { error: "Entry archiving is not available until the Scrapbook database migration is applied." };
+    if (/column .*?archived_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) return { error: "Per-memory archive needs the latest SyncParty database migration." };
     throw error;
   }
-  return { entry: rowToEntry(data) };
+  return { entries: (data || []).map(rowToEntry) };
 }
 
-async function removeEntry(userId, entryId) {
+async function reconcileEntries(userId, entries) {
   const sb = getSupabaseAdmin();
-  const found = await sb.from("scrapbook_entries").select("id,user_id,scope,relation_id,source_key").eq("id", entryId).eq("user_id", userId).maybeSingle();
-  if (found.error) throw found.error;
-  if (!found.data) return { entry: null, removed: false };
-  let q = sb.from("scrapbook_entries").delete().eq("source_key", found.data.source_key);
-  if (String(found.data.scope || '').startsWith('shared:') && found.data.relation_id) q = q.eq("relation_id", found.data.relation_id);
-  else q = q.eq("user_id", userId).eq("id", entryId);
-  const { error } = await q;
+  const incoming = Array.isArray(entries) ? entries.slice(0, 500) : [];
+  const sourceKeys = incoming.map(e => String(e?.sourceKey || "")).filter(Boolean);
+  if (!sourceKeys.length) return { reconciledAt: now(), entries: [] };
+  const { data, error } = await sb.from("scrapbook_entries")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("scope", "personal")
+    .in("source_key", sourceKeys);
   if (error) throw error;
-  return { entry: { id: entryId, sourceKey: found.data.source_key, scope: found.data.scope }, legacyDeleted: true };
+  const byKey = new Map((data || []).map(r => [String(r.source_key), rowToEntry(r)]));
+  const fields=["title","contentType","canonicalTitle","thumbnail","artwork","backdrop","platform","season","episode","progress","status","watchDurationSec","togetherDurationSec","sessionCount","completedAt","metadataProvider","metadataId","metadataYear","storyTotalEpisodes","storyEpisodesCompleted","storyProgress","storyProgressConfidence","seriesEpisodeCounts","firstWatchedAt","lastWatchedAt","archivedAt"];
+  const fingerprint = obj => JSON.stringify(fields.map(k => obj?.[k] ?? null));
+  const result=incoming.map(e=>{
+    const k=String(e?.sourceKey || ""); const server=byKey.get(k);
+    if(!server) return {sourceKey:k,state:"failed",reason:"missing-on-server"};
+    return {sourceKey:k,state:fingerprint(e)===fingerprint(server)?"synced":"failed",reason:fingerprint(e)===fingerprint(server)?null:"mismatch"};
+  });
+  return { reconciledAt: now(), entries: result };
 }
-
 
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
@@ -438,6 +439,18 @@ async function respondInvite(inviteId, userId, accept) {
   return { relation: await relationView(relation) };
 }
 
+async function archiveRelation(relationId, userId) {
+  const sb = getSupabaseAdmin();
+  const { data: rel, error: findError } = await sb.from("relations").select("*").eq("id", relationId).maybeSingle();
+  if (findError) throw findError;
+  if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
+  if (rel.archived_at) return { relation: await relationView(rel) };
+  const { data, error } = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
+  if (!error) return { relation: await relationView(data) };
+  if (isMissingColumnError(error, "archived_at")) return { error: "Archiving Our Story isn't available yet — please run the latest database migration." };
+  throw error;
+}
+
 // Archives a relation (does not delete it) so its shared memories remain
 // viewable/read-only, while freeing both participants to start a new Our
 // Story. Idempotent: ending an already-archived story just returns its
@@ -449,9 +462,13 @@ async function endRelation(relationId, userId) {
   if (findError) throw findError;
   if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
   if (rel.archived_at) return { relation: await relationView(rel) };
-  const { data, error } = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
+  const { data, error } = await sb.from("relations").update({ archived_at: now(), ended_at: now() }).eq("id", relationId).select("*").maybeSingle();
   if (!error) return { relation: await relationView(data) };
-  if (isMissingColumnError(error, "archived_at")) return { error: "Ending Our Story isn't available yet — please try again in a moment." };
+  if (/column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
+    const retry = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
+    if (!retry.error) return { relation: await relationView(retry.data) };
+  }
+  if (isMissingColumnError(error, "archived_at")) return { error: "Ending Our Story isn't available yet — please run the latest database migration." };
   throw error;
 }
 
@@ -476,13 +493,14 @@ module.exports = {
   listUserRelations,
   listPersonalEntries,
   listSharedEntries,
-  setEntryArchive,
-  removeEntry,
   upsertEntry,
   createInvite,
   listInvites,
   respondInvite,
   endRelation,
+  archiveRelation,
+  mutateEntries,
+  reconcileEntries,
   getHighlights,
   rowToInvite
 };

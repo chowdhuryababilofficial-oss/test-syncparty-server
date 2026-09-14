@@ -74,15 +74,11 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,user:publicUser(user)}); return;
     }
 
-    if (path === "/api/auth/identity" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return;
-      const b=await readJson(req);
-      const partyAvatar = String(b.partyAvatar || "").trim().slice(0,16);
-      const displayName = String(b.displayName || "").trim().slice(0,24);
-      if(!displayName){json(res,400,{ok:false,error:"Enter a display name."});return;}
-      if(!partyAvatar){json(res,400,{ok:false,error:"Choose a party avatar."});return;}
-      const updated=await updatePartyIdentity(user.id,{displayName,partyAvatar});
-      json(res,200,{ok:true,user:publicUser(updated)}); return;
+    if (path === "/api/account/identity" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await updatePartyIdentity(user.id,{partyName:b.partyName,partyAvatar:b.partyAvatar});
+      if(result.error){json(res,503,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,user:publicUser(result.user)}); return;
     }
 
     if (path === "/api/auth/google/exchange" && req.method === "POST") {
@@ -118,10 +114,9 @@ const httpServer = http.createServer(async (req, res) => {
       const scope=u.searchParams.get("scope")==="shared"?"shared":"personal";
       const relationId=u.searchParams.get("relationId")||null;
       const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
-      const includeArchived=u.searchParams.get("archived")==="all" || u.searchParams.get("archived")==="include";
       const entries=scope==='shared'
-        ? await scrapbook.listSharedEntries(user.id,relationId,limit,includeArchived)
-        : await scrapbook.listPersonalEntries(user.id,limit,includeArchived);
+        ? await scrapbook.listSharedEntries(user.id,relationId,limit,true)
+        : await scrapbook.listPersonalEntries(user.id,limit,true);
       const relations=await scrapbook.listUserRelations(user.id);
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
@@ -148,19 +143,24 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,entries:out}); return;
     }
 
-    if (path === "/api/scrapbook/entry/archive" && req.method === "POST") {
+    if (path === "/api/scrapbook/reconcile" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      if(!b.entryId){json(res,400,{ok:false,error:'Missing entryId.'});return;}
-      const result=await scrapbook.setEntryArchive(user.id,b.entryId,!!b.archived);
-      if(result.error){json(res,409,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,entry:result.entry}); return;
+      const result=await scrapbook.reconcileEntries(user.id,b.entries);
+      json(res,200,{ok:true,...result}); return;
     }
 
-    if (path === "/api/scrapbook/entry/remove" && req.method === "POST") {
+    if (path === "/api/scrapbook/entries/archive" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      if(!b.entryId){json(res,400,{ok:false,error:'Missing entryId.'});return;}
-      const result=await scrapbook.removeEntry(user.id,b.entryId);
-      json(res,200,{ok:true,entry:result.entry,legacyDeleted:!!result.legacyDeleted}); return;
+      const result=await scrapbook.mutateEntries(user.id,b.entryIds,"archive",!!b.archived);
+      if(result.error){json(res,503,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,...result}); return;
+    }
+
+    if (path === "/api/scrapbook/entries/remove" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.mutateEntries(user.id,b.entryIds,"remove",false);
+      if(result.error){json(res,503,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,...result}); return;
     }
 
     if (path === "/api/scrapbook/relationship" && req.method === "GET") {
@@ -184,6 +184,14 @@ const httpServer = http.createServer(async (req, res) => {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const result=await scrapbook.respondInvite(b.inviteId,user.id,!!b.accept);
       if(result.error){json(res,404,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,relation:result.relation});return;
+    }
+
+    if (path === "/api/scrapbook/relationship/archive" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!b.relationId){json(res,400,{ok:false,error:'Missing relationId.'});return;}
+      const result=await scrapbook.archiveRelation(b.relationId,user.id);
+      if(result.error){json(res,503,{ok:false,error:result.error});return;}
       json(res,200,{ok:true,relation:result.relation});return;
     }
 

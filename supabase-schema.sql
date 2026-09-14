@@ -13,7 +13,7 @@ create table if not exists public.users (
   name text not null,
   avatar text not null default '🦊',
   color text not null default '#54a0ff',
-  display_name text,
+  party_name text,
   party_avatar text,
   provider text not null check (provider in ('email','google')),
   password_hash text,
@@ -46,6 +46,7 @@ create table if not exists public.relations (
   created_at bigint not null,
   accepted_at bigint,
   archived_at bigint,
+  ended_at bigint,
   constraint relations_distinct_users check (user1_id <> user2_id),
   constraint relations_sorted_users check (user1_id < user2_id)
 );
@@ -204,10 +205,18 @@ alter table public.scrapbook_entries add column if not exists story_episodes_com
 alter table public.scrapbook_entries add column if not exists story_progress numeric(5,4);
 alter table public.scrapbook_entries add column if not exists story_progress_confidence numeric(5,4);
 alter table public.scrapbook_entries add column if not exists series_episode_counts jsonb;
-alter table public.scrapbook_entries add column if not exists archived_at bigint;
-
-alter table public.users add column if not exists display_name text;
-alter table public.users add column if not exists party_avatar text;
 -- Existing rows predate session counting; treat each as at least one
 -- known session rather than leaving a misleading 0.
 update public.scrapbook_entries set session_count = 1 where session_count = 0;
+
+
+-- Scrapbook identity/sync/memory-management additive migration.
+alter table public.users add column if not exists party_name text;
+alter table public.users add column if not exists party_avatar text;
+update public.users set party_name = name where party_name is null;
+update public.users set party_avatar = avatar where party_avatar is null;
+alter table public.users alter column party_name set default 'SyncParty user';
+alter table public.users alter column party_avatar set default '🦊';
+alter table public.relations add column if not exists ended_at bigint;
+alter table public.scrapbook_entries add column if not exists archived_at bigint;
+create index if not exists scrapbook_entries_archive_idx on public.scrapbook_entries(user_id, archived_at, last_watched_at desc);
