@@ -125,6 +125,10 @@ async function relationView(r) {
   };
 }
 
+function isMissingColumnError(error, col) {
+  return !!error && new RegExp(`column\\s+["']?${col}["']?.*?(does not exist|unknown)`, "i").test(String(error.message || ""));
+}
+
 // "One active Our Story at a time": a user's single active relation, if any
 // (accepted and not archived), regardless of which partner it's with.
 async function getActiveRelationForUser(userId) {
@@ -136,8 +140,24 @@ async function getActiveRelationForUser(userId) {
     .is("archived_at", null)
     .limit(1)
     .maybeSingle();
-  if (error) throw error;
-  return data || null;
+  if (!error) return data || null;
+  // A deployment that hasn't yet run the archived_at migration (see
+  // supabase-schema.sql) has no "archived" concept at all — every accepted
+  // relation is active there. Retrying without that filter instead of
+  // hard-failing is what actually fixes "SyncParty server error." on Start
+  // Our Story for two brand-new accounts: this query runs on every invite
+  // attempt, so a not-yet-migrated database made the whole feature crash.
+  if (isMissingColumnError(error, "archived_at")) {
+    const retry = await sb.from("relations")
+      .select("id,user1_id,user2_id,created_at,accepted_at")
+      .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
+      .not("accepted_at", "is", null)
+      .limit(1)
+      .maybeSingle();
+    if (retry.error) throw retry.error;
+    return retry.data || null;
+  }
+  throw error;
 }
 
 async function listUserRelations(userId) {
@@ -339,15 +359,25 @@ async function respondInvite(inviteId, userId, accept) {
     const { data, error } = await sb.from("relations").insert(row).select("*").maybeSingle();
     if (error) {
       if (error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id);
-      else throw error;
+      else if (isMissingColumnError(error, "archived_at")) {
+        const legacyRow = { ...row }; delete legacyRow.archived_at;
+        const retry = await sb.from("relations").insert(legacyRow).select("*").maybeSingle();
+        if (retry.error) { if (retry.error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id); else throw retry.error; }
+        else relation = retry.data;
+      } else throw error;
     } else relation = data;
   } else if (!relation.accepted_at || relation.archived_at) {
     // Either a brand-new acceptance, or restarting a previously-archived
     // story with the SAME partner — reuse the row (the pair unique index
     // means a second row for this exact pair can never be inserted).
     const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt, archived_at: null }).eq("id", relation.id).select("*").maybeSingle();
-    if (error) throw error;
-    relation = data;
+    if (error) {
+      if (isMissingColumnError(error, "archived_at")) {
+        const retry = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
+        if (retry.error) throw retry.error;
+        relation = retry.data;
+      } else throw error;
+    } else relation = data;
   }
   return { relation: await relationView(relation) };
 }
@@ -364,8 +394,9 @@ async function endRelation(relationId, userId) {
   if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
   if (rel.archived_at) return { relation: await relationView(rel) };
   const { data, error } = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
-  if (error) throw error;
-  return { relation: await relationView(data) };
+  if (!error) return { relation: await relationView(data) };
+  if (isMissingColumnError(error, "archived_at")) return { error: "Ending Our Story isn't available yet — please try again in a moment." };
+  throw error;
 }
 
 async function getHighlights(userId) {
