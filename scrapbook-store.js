@@ -120,8 +120,24 @@ async function relationView(r) {
     id: r.id,
     users: [publicUser(a), publicUser(b)],
     createdAt: Number(r.created_at || 0),
-    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at)
+    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at),
+    archivedAt: r.archived_at == null ? null : Number(r.archived_at)
   };
+}
+
+// "One active Our Story at a time": a user's single active relation, if any
+// (accepted and not archived), regardless of which partner it's with.
+async function getActiveRelationForUser(userId) {
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb.from("relations")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
+    .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
+    .not("accepted_at", "is", null)
+    .is("archived_at", null)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
 }
 
 async function listUserRelations(userId) {
@@ -241,7 +257,17 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
   const relation = await getRelation(fromUserId, toUserId);
-  if (relation?.accepted_at) return { relation: await relationView(relation) };
+  if (relation?.accepted_at && !relation.archived_at) return { relation: await relationView(relation) };
+  // "One active Our Story at a time": neither party may invite/be invited
+  // while already in an active (accepted, unarchived) story with someone
+  // else. A pre-existing (possibly archived) relation with THIS SAME
+  // partner is fine — that's a restart, handled in respondInvite.
+  const [fromActive, toActive] = await Promise.all([
+    getActiveRelationForUser(fromUserId),
+    getActiveRelationForUser(toUserId)
+  ]);
+  if (fromActive && !(relation && fromActive.id === relation.id)) return { error: "You already have an active Our Story. End it before starting a new one." };
+  if (toActive && !(relation && toActive.id === relation.id)) return { error: "They already have an active Our Story with someone else." };
   const { data: existing, error: findError } = await sb.from("invites")
     .select("*").eq("from_user_id", fromUserId).eq("to_user_id", toUserId).eq("status", "pending").maybeSingle();
   if (findError) throw findError;
@@ -284,6 +310,24 @@ async function respondInvite(inviteId, userId, accept) {
   if (findError) throw findError;
   if (!inv) return { error: "Invitation no longer exists." };
   const respondedAt = now();
+  if (accept) {
+    // Race guard: re-verify eligibility right before committing, since
+    // either side may have started (or been placed into) an active story
+    // with someone else in the time between this invite being shown and
+    // the user clicking Accept.
+    const preExisting = await getRelation(inv.from_user_id, inv.to_user_id);
+    const alreadyActiveWithEachOther = !!(preExisting?.accepted_at && !preExisting.archived_at);
+    if (!alreadyActiveWithEachOther) {
+      const [fromActive, toActive] = await Promise.all([
+        getActiveRelationForUser(inv.from_user_id),
+        getActiveRelationForUser(inv.to_user_id)
+      ]);
+      if (fromActive || toActive) {
+        await sb.from("invites").update({ status: "declined", responded_at: respondedAt }).eq("id", inviteId);
+        return { error: "This invitation is no longer available — one of you already has an active Our Story." };
+      }
+    }
+  }
   const { error: updateError } = await sb.from("invites").update({ status: accept ? "accepted" : "declined", responded_at: respondedAt }).eq("id", inviteId);
   if (updateError) throw updateError;
   if (!accept) return { relation: null };
@@ -291,18 +335,37 @@ async function respondInvite(inviteId, userId, accept) {
   const existing = await getRelation(inv.from_user_id, inv.to_user_id);
   let relation = existing;
   if (!relation) {
-    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt };
+    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt, archived_at: null };
     const { data, error } = await sb.from("relations").insert(row).select("*").maybeSingle();
     if (error) {
       if (error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id);
       else throw error;
     } else relation = data;
-  } else if (!relation.accepted_at) {
-    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
+  } else if (!relation.accepted_at || relation.archived_at) {
+    // Either a brand-new acceptance, or restarting a previously-archived
+    // story with the SAME partner — reuse the row (the pair unique index
+    // means a second row for this exact pair can never be inserted).
+    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt, archived_at: null }).eq("id", relation.id).select("*").maybeSingle();
     if (error) throw error;
     relation = data;
   }
   return { relation: await relationView(relation) };
+}
+
+// Archives a relation (does not delete it) so its shared memories remain
+// viewable/read-only, while freeing both participants to start a new Our
+// Story. Idempotent: ending an already-archived story just returns its
+// current (already-archived) state as success, so two near-simultaneous
+// "End Our Story" clicks — from either or both users — never error.
+async function endRelation(relationId, userId) {
+  const sb = getSupabaseAdmin();
+  const { data: rel, error: findError } = await sb.from("relations").select("*").eq("id", relationId).maybeSingle();
+  if (findError) throw findError;
+  if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
+  if (rel.archived_at) return { relation: await relationView(rel) };
+  const { data, error } = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
+  if (error) throw error;
+  return { relation: await relationView(data) };
 }
 
 async function getHighlights(userId) {
@@ -322,6 +385,7 @@ module.exports = {
   getUser,
   getRelation,
   relationView,
+  getActiveRelationForUser,
   listUserRelations,
   listPersonalEntries,
   listSharedEntries,
@@ -329,6 +393,7 @@ module.exports = {
   createInvite,
   listInvites,
   respondInvite,
+  endRelation,
   getHighlights,
   rowToInvite
 };

@@ -140,13 +140,15 @@ const httpServer = http.createServer(async (req, res) => {
       const user=await requireUser(req,res); if(!user)return; const partnerId=u.searchParams.get('partnerId');
       const relation=partnerId?await scrapbook.getRelation(user.id,partnerId):null;
       const invites=await scrapbook.listInvites(user.id);
-      json(res,200,{ok:true,relation:await scrapbook.relationView(relation),...invites}); return;
+      const activeRelation=await scrapbook.getActiveRelationForUser(user.id);
+      json(res,200,{ok:true,relation:await scrapbook.relationView(relation),activeRelation:await scrapbook.relationView(activeRelation),...invites}); return;
     }
 
     if (path === "/api/scrapbook/relationship/invite" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req); const partner=await scrapbook.getUser(b.partnerId);
       if(!partner||partner.id===user.id){json(res,400,{ok:false,error:'Choose a valid partner account.'});return;}
       const result=await scrapbook.createInvite(user.id,partner.id);
+      if(result.error){json(res,409,{ok:false,error:result.error});return;}
       if(result.relation){json(res,200,{ok:true,relation:result.relation});return;}
       json(res,200,{ok:true,invite:result.invite});return;
     }
@@ -154,6 +156,14 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/relationship/respond" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const result=await scrapbook.respondInvite(b.inviteId,user.id,!!b.accept);
+      if(result.error){json(res,404,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,relation:result.relation});return;
+    }
+
+    if (path === "/api/scrapbook/relationship/end" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!b.relationId){json(res,400,{ok:false,error:'Missing relationId.'});return;}
+      const result=await scrapbook.endRelation(b.relationId,user.id);
       if(result.error){json(res,404,{ok:false,error:result.error});return;}
       json(res,200,{ok:true,relation:result.relation});return;
     }

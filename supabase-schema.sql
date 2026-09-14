@@ -43,9 +43,21 @@ create table if not exists public.relations (
   user2_id text not null references public.users(id) on delete cascade,
   created_at bigint not null,
   accepted_at bigint,
+  archived_at bigint,
   constraint relations_distinct_users check (user1_id <> user2_id),
   constraint relations_sorted_users check (user1_id < user2_id)
 );
+
+-- Added for the "one active Our Story at a time" rule: a relation that has
+-- been ended is archived (archived_at set) rather than deleted, so its
+-- shared memories/history stay intact and viewable. The existing pair
+-- unique index means the SAME two users reuse this one row across an
+-- end -> restart cycle instead of inserting a new one.
+alter table public.relations add column if not exists archived_at bigint;
+
+create index if not exists relations_active_lookup_idx
+  on public.relations(user1_id, user2_id)
+  where accepted_at is not null and archived_at is null;
 
 create unique index if not exists relations_pair_uidx
   on public.relations(user1_id,user2_id);
