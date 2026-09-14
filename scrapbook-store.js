@@ -111,11 +111,28 @@ async function getUser(userId) {
 async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
+  const fullSelect = "id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at";
+  const archivedSelect = "id,user1_id,user2_id,created_at,accepted_at,archived_at";
+  const baseSelect = "id,user1_id,user2_id,created_at,accepted_at";
+
   let { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
+    .select(fullSelect)
     .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-  if (error && /column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
-    const legacy = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at,archived_at").eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
+
+  // The new Scrapbook relation fields are additive. A live/older Supabase
+  // deployment may not have one or both columns yet; invitation creation
+  // must still work in that environment instead of bubbling a 500 that the
+  // production server masks as the generic "SyncParty server error."
+  if (error && isMissingColumnError(error, "ended_at")) {
+    const legacy = await sb.from("relations")
+      .select(archivedSelect)
+      .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
+    data = legacy.data; error = legacy.error;
+  }
+  if (error && isMissingColumnError(error, "archived_at")) {
+    const legacy = await sb.from("relations")
+      .select(baseSelect)
+      .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
     data = legacy.data; error = legacy.error;
   }
   if (error) throw error;
