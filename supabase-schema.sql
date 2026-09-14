@@ -13,6 +13,8 @@ create table if not exists public.users (
   name text not null,
   avatar text not null default '🦊',
   color text not null default '#54a0ff',
+  display_name text,
+  party_avatar text,
   provider text not null check (provider in ('email','google')),
   password_hash text,
   password_salt text,
@@ -116,6 +118,7 @@ create table if not exists public.scrapbook_entries (
   last_watched_at bigint not null,
   created_at bigint not null,
   updated_at bigint not null,
+  archived_at bigint,
   constraint scrapbook_scope_check check (
     (scope = 'personal' and relation_id is null)
     or
@@ -201,6 +204,10 @@ alter table public.scrapbook_entries add column if not exists story_episodes_com
 alter table public.scrapbook_entries add column if not exists story_progress numeric(5,4);
 alter table public.scrapbook_entries add column if not exists story_progress_confidence numeric(5,4);
 alter table public.scrapbook_entries add column if not exists series_episode_counts jsonb;
+alter table public.scrapbook_entries add column if not exists archived_at bigint;
+
+alter table public.users add column if not exists display_name text;
+alter table public.users add column if not exists party_avatar text;
 -- Existing rows predate session counting; treat each as at least one
 -- known session rather than leaving a misleading 0.
 update public.scrapbook_entries set session_count = 1 where session_count = 0;

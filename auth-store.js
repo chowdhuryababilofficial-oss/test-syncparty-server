@@ -40,8 +40,10 @@ function publicUser(user) {
   return {
     id: user.id,
     name: user.name,
+    displayName: user.displayName || null,
     email: user.email || null,
     avatar: user.avatar || "🦊",
+    partyAvatar: user.partyAvatar || null,
     color: user.color || "#54a0ff",
     provider: user.provider || "email"
   };
@@ -53,7 +55,9 @@ function rowToUser(row) {
     id: row.id,
     email: row.email,
     name: row.name,
+    displayName: row.display_name || null,
     avatar: row.avatar,
+    partyAvatar: row.party_avatar || null,
     color: row.color,
     provider: row.provider,
     passwordHash: row.password_hash,
@@ -73,6 +77,8 @@ async function createEmailUser({ email, password, name }) {
     name: String(name || email.split("@")[0] || "SyncParty user").slice(0, 24),
     avatar: "🦊",
     color: "#54a0ff",
+    display_name: null,
+    party_avatar: null,
     provider: "email",
     password_hash: hp.hash,
     password_salt: hp.salt,
@@ -124,6 +130,8 @@ async function createGoogleUser({ sub, email, name }) {
     name: String(name || email?.split("@")[0] || "SyncParty user").slice(0, 24),
     avatar: "🦊",
     color: "#54a0ff",
+    display_name: null,
+    party_avatar: null,
     provider: "google",
     password_hash: null,
     password_salt: null,
@@ -146,6 +154,17 @@ async function updateGoogleUser(userId, { email, name }) {
   const patch = {
     email: normalizeEmail(email),
     name: String(name || "SyncParty user").slice(0, 24)
+  };
+  const { data, error } = await sb.from("users").update(patch).eq("id", userId).select("*").maybeSingle();
+  if (error) throw error;
+  return rowToUser(data);
+}
+
+async function updatePartyIdentity(userId, { displayName, partyAvatar }) {
+  const sb = getSupabaseAdmin();
+  const patch = {
+    display_name: String(displayName || "").trim().slice(0, 24) || null,
+    party_avatar: String(partyAvatar || "").trim().slice(0, 16) || null
   };
   const { data, error } = await sb.from("users").update(patch).eq("id", userId).select("*").maybeSingle();
   if (error) throw error;
@@ -198,6 +217,7 @@ module.exports = {
   getGoogleUser,
   createGoogleUser,
   updateGoogleUser,
+  updatePartyIdentity,
   createSession,
   resolveSession,
   revokeSession,

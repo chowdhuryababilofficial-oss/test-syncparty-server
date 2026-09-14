@@ -1,6 +1,6 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
+const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, updatePartyIdentity, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
 const metadataResolver = require("./metadata-resolver");
 const port = Number(process.env.PORT || 8787);
@@ -74,6 +74,17 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,user:publicUser(user)}); return;
     }
 
+    if (path === "/api/auth/identity" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return;
+      const b=await readJson(req);
+      const partyAvatar = String(b.partyAvatar || "").trim().slice(0,16);
+      const displayName = String(b.displayName || "").trim().slice(0,24);
+      if(!displayName){json(res,400,{ok:false,error:"Enter a display name."});return;}
+      if(!partyAvatar){json(res,400,{ok:false,error:"Choose a party avatar."});return;}
+      const updated=await updatePartyIdentity(user.id,{displayName,partyAvatar});
+      json(res,200,{ok:true,user:publicUser(updated)}); return;
+    }
+
     if (path === "/api/auth/google/exchange" && req.method === "POST") {
       if(!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET){json(res,503,{ok:false,error:"Google sign-in is not configured on this SyncParty server."});return;}
       const b=await readJson(req); if(!b.code || !b.redirectUri){json(res,400,{ok:false,error:"Missing Google authorization data."});return;}
@@ -107,9 +118,10 @@ const httpServer = http.createServer(async (req, res) => {
       const scope=u.searchParams.get("scope")==="shared"?"shared":"personal";
       const relationId=u.searchParams.get("relationId")||null;
       const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
+      const includeArchived=u.searchParams.get("archived")==="all" || u.searchParams.get("archived")==="include";
       const entries=scope==='shared'
-        ? await scrapbook.listSharedEntries(user.id,relationId,limit)
-        : await scrapbook.listPersonalEntries(user.id,limit);
+        ? await scrapbook.listSharedEntries(user.id,relationId,limit,includeArchived)
+        : await scrapbook.listPersonalEntries(user.id,limit,includeArchived);
       const relations=await scrapbook.listUserRelations(user.id);
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
@@ -134,6 +146,21 @@ const httpServer = http.createServer(async (req, res) => {
       const entries=Array.isArray(b.entries)?b.entries.slice(0,500):[];
       const out=[]; for(const e of entries) out.push(await scrapbook.upsertEntry(user.id,e,null));
       json(res,200,{ok:true,entries:out}); return;
+    }
+
+    if (path === "/api/scrapbook/entry/archive" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!b.entryId){json(res,400,{ok:false,error:'Missing entryId.'});return;}
+      const result=await scrapbook.setEntryArchive(user.id,b.entryId,!!b.archived);
+      if(result.error){json(res,409,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,entry:result.entry}); return;
+    }
+
+    if (path === "/api/scrapbook/entry/remove" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!b.entryId){json(res,400,{ok:false,error:'Missing entryId.'});return;}
+      const result=await scrapbook.removeEntry(user.id,b.entryId);
+      json(res,200,{ok:true,entry:result.entry,legacyDeleted:!!result.legacyDeleted}); return;
     }
 
     if (path === "/api/scrapbook/relationship" && req.method === "GET") {

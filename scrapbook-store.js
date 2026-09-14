@@ -14,6 +14,8 @@ function rowToEntry(row) {
     id: row.id,
     userId: row.user_id,
     scope: row.scope,
+    archivedAt: row.archived_at == null ? null : Number(row.archived_at),
+    removedAt: row.removed_at == null ? null : Number(row.removed_at),
     relationId: row.relation_id,
     sourceKey: row.source_key,
     title: row.title,
@@ -96,10 +98,10 @@ function normalizeEntry(entry, existing = null) {
 
 async function getUser(userId) {
   const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("users").select("id,name,email,avatar,color,provider").eq("id", userId).maybeSingle();
+  const { data, error } = await sb.from("users").select("*").eq("id", userId).maybeSingle();
   if (error) throw error;
   return data ? {
-    id: data.id, name: data.name, email: data.email, avatar: data.avatar, color: data.color, provider: data.provider
+    id: data.id, name: data.name, displayName: data.display_name || null, email: data.email, avatar: data.avatar, partyAvatar: data.party_avatar || null, color: data.color, provider: data.provider
   } : null;
 }
 
@@ -107,10 +109,15 @@ async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
     .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-  if (error) throw error;
-  return data || null;
+  if (!error) return data || null;
+  if (isMissingColumnError(error, "archived_at")) {
+    const retry = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at").eq("user1_id",ids[0]).eq("user2_id",ids[1]).maybeSingle();
+    if (retry.error) throw retry.error;
+    return retry.data || null;
+  }
+  throw error;
 }
 
 async function relationView(r) {
@@ -163,26 +170,40 @@ async function getActiveRelationForUser(userId) {
 async function listUserRelations(userId) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at")
+    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
-  if (error) throw error;
-  return Promise.all((data || []).map(relationView));
+  if (!error) return Promise.all((data || []).map(relationView));
+  if (isMissingColumnError(error, "archived_at")) {
+    const retry = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at").or(`user1_id.eq.${userId},user2_id.eq.${userId}`).order("created_at", { ascending:false });
+    if (retry.error) throw retry.error;
+    return Promise.all((retry.data || []).map(relationView));
+  }
+  throw error;
 }
 
-async function listPersonalEntries(userId, limit = 150) {
+async function listPersonalEntries(userId, limit = 150, includeArchived = false) {
   const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("scrapbook_entries")
+  let q = sb.from("scrapbook_entries")
     .select("*")
     .eq("user_id", userId)
     .eq("scope", "personal")
     .order("last_watched_at", { ascending: false })
     .limit(limit);
-  if (error) throw error;
+  if (!includeArchived) q = q.is("archived_at", null);
+  const { data, error } = await q;
+  if (error) {
+    if (isMissingColumnError(error, "archived_at")) {
+      const legacy = await sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", "personal").order("last_watched_at", { ascending: false }).limit(limit);
+      if (legacy.error) throw legacy.error;
+      return (legacy.data || []).map(rowToEntry);
+    }
+    throw error;
+  }
   return (data || []).map(rowToEntry);
 }
 
-async function listSharedEntries(userId, relationId = null, limit = 150) {
+async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = false) {
   const sb = getSupabaseAdmin();
   let q = sb.from("scrapbook_entries")
     .select("*")
@@ -191,8 +212,18 @@ async function listSharedEntries(userId, relationId = null, limit = 150) {
     .order("last_watched_at", { ascending: false })
     .limit(limit);
   if (relationId) q = q.eq("relation_id", relationId);
+  if (!includeArchived) q = q.is("archived_at", null);
   const { data, error } = await q;
-  if (error) throw error;
+  if (error) {
+    if (isMissingColumnError(error, "archived_at")) {
+      let legacy = sb.from("scrapbook_entries").select("*").eq("user_id", userId).like("scope", "shared:%").order("last_watched_at", { ascending: false }).limit(limit);
+      if (relationId) legacy = legacy.eq("relation_id", relationId);
+      const retry = await legacy;
+      if (retry.error) throw retry.error;
+      return (retry.data || []).map(rowToEntry);
+    }
+    throw error;
+  }
   return (data || []).map(rowToEntry);
 }
 
@@ -273,6 +304,31 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
   }
   return rowToEntry(data);
 }
+
+async function setEntryArchive(userId, entryId, archived) {
+  const sb = getSupabaseAdmin();
+  const patch = { archived_at: archived ? now() : null };
+  const { data, error } = await sb.from("scrapbook_entries").update(patch).eq("id", entryId).eq("user_id", userId).select("*").maybeSingle();
+  if (error) {
+    if (isMissingColumnError(error, "archived_at")) return { error: "Entry archiving is not available until the Scrapbook database migration is applied." };
+    throw error;
+  }
+  return { entry: rowToEntry(data) };
+}
+
+async function removeEntry(userId, entryId) {
+  const sb = getSupabaseAdmin();
+  const found = await sb.from("scrapbook_entries").select("id,user_id,scope,relation_id,source_key").eq("id", entryId).eq("user_id", userId).maybeSingle();
+  if (found.error) throw found.error;
+  if (!found.data) return { entry: null, removed: false };
+  let q = sb.from("scrapbook_entries").delete().eq("source_key", found.data.source_key);
+  if (String(found.data.scope || '').startsWith('shared:') && found.data.relation_id) q = q.eq("relation_id", found.data.relation_id);
+  else q = q.eq("user_id", userId).eq("id", entryId);
+  const { error } = await q;
+  if (error) throw error;
+  return { entry: { id: entryId, sourceKey: found.data.source_key, scope: found.data.scope }, legacyDeleted: true };
+}
+
 
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
@@ -420,6 +476,8 @@ module.exports = {
   listUserRelations,
   listPersonalEntries,
   listSharedEntries,
+  setEntryArchive,
+  removeEntry,
   upsertEntry,
   createInvite,
   listInvites,
