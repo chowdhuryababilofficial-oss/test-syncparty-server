@@ -76,6 +76,22 @@ async function resolve(input = {}) {
     }
   }
 
+  // Episode name, only when we have a confident series match AND a real
+  // season+episode. TMDB is authoritative here, so this is the most reliable
+  // episode-title source we have; a miss simply leaves it null and the UI
+  // falls back to "Episode N" rather than guessing from the page title.
+  let episodeTitle = null;
+  if (contentType !== "movie") {
+    const sNum = Number(provisional.season ?? meta.season);
+    const eNum = Number(provisional.episode ?? meta.episode);
+    if (Number.isInteger(sNum) && sNum > 0 && Number.isInteger(eNum) && eNum > 0) {
+      const ep = await tmdb(`/tv/${selected.id}/season/${sNum}/episode/${eNum}?language=en-US`);
+      const epName = clean(ep?.name || "");
+      // TMDB returns a placeholder like "Episode 5" when it has no real title.
+      if (epName && !/^episode\s*\d+$/i.test(epName)) episodeTitle = epName;
+    }
+  }
+
   const artworkCandidates = [
     image(details?.poster_path, "w780"),
     image(details?.backdrop_path, "w1280"),
@@ -91,6 +107,7 @@ async function resolve(input = {}) {
     contentType,
     season: Number.isInteger(Number(provisional.season ?? meta.season)) ? Number(provisional.season ?? meta.season) : null,
     episode: Number.isInteger(Number(provisional.episode ?? meta.episode)) ? Number(provisional.episode ?? meta.episode) : null,
+    episodeTitle,
     artwork: artworkCandidates[0] || null,
     backdrop: image(details?.backdrop_path, "w1280") || artworkCandidates[0] || null,
     artworkCandidates: artworkCandidates.slice(0, 10),

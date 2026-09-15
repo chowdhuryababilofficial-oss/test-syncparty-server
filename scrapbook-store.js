@@ -27,6 +27,7 @@ function rowToEntry(row) {
     platform: row.platform,
     season: row.season == null ? null : Number(row.season),
     episode: row.episode == null ? null : Number(row.episode),
+    episodeTitle: row.episode_title || null,
     progress: Number(row.progress || 0),
     status: row.status,
     watchDurationSec: Number(row.watch_duration_sec || 0),
@@ -64,8 +65,14 @@ function normalizeEntry(entry, existing = null) {
       : (existing?.artwork_candidates || []),
     thumbnail: entry.thumbnail ? String(entry.thumbnail).slice(0, 2000) : (existing?.thumbnail || null),
     platform: String(entry.platform || existing?.platform || "").slice(0, 80),
-    season: Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
-    episode: Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
+    // entry.season/episode arrive as null for movies; Number(null) is 0 and
+    // Number.isFinite(0) is true, so guard against null explicitly or every
+    // movie would be written as "season 0".
+    season: entry.season != null && Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
+    episode: entry.episode != null && Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
+    // Never overwrite a known episode name with null: a later save from a
+    // page without JSON-LD must not erase a title we already resolved.
+    episode_title: entry.episodeTitle ? String(entry.episodeTitle).slice(0, 240) : (existing?.episode_title ?? null),
     progress: Math.max(0, Math.min(1, Number(entry.progress) || Number(existing?.progress || 0))),
     status: ["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching"),
     watch_duration_sec: existing
@@ -219,7 +226,7 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // An existing deployment may not yet have the optional artwork/title columns.
     // Retry only the legacy-compatible fields; anime still correctly requires the
     // existing kind/content_type constraint to permit it.
-    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
       // Every column named in the regex above must be stripped here too —
       // this list previously only dropped the original three (content_type/
@@ -240,6 +247,7 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
       delete legacyRow.metadata_provider;
       delete legacyRow.metadata_id;
       delete legacyRow.metadata_year;
+      delete legacyRow.episode_title;
       delete legacyRow.story_total_episodes;
       delete legacyRow.story_episodes_completed;
       delete legacyRow.story_progress;
