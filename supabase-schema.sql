@@ -13,12 +13,6 @@ create table if not exists public.users (
   name text not null,
   avatar text not null default '🦊',
   color text not null default '#54a0ff',
-  -- Party Identity: the identity shown to other SyncParty users. Null means
-  -- "never claimed" so the next sign-in can adopt the guest Party Identity.
-  -- Google/OAuth name+email live in name/email and never write these columns.
-  party_name text,
-  party_avatar text,
-  party_color text,
   provider text not null check (provider in ('email','google')),
   password_hash text,
   password_salt text,
@@ -26,10 +20,20 @@ create table if not exists public.users (
   created_at bigint not null
 );
 
--- Migration for workspaces created before Party Identity existed.
+-- Party Identity columns: the social identity shown to other SyncParty users.
+-- Deliberately separate from name/email (Google/OAuth identity) so signing in
+-- can never overwrite a user's Party Name / emoji PFP / party color.
 alter table public.users add column if not exists party_name text;
 alter table public.users add column if not exists party_avatar text;
 alter table public.users add column if not exists party_color text;
+
+-- Ending or archiving an Our Story is non-destructive: the relation row and all
+-- shared memories are kept, only stamped so the story is no longer active.
+alter table public.relations add column if not exists archived_at bigint;
+alter table public.relations add column if not exists ended_at bigint;
+
+-- Archived memories stay saved and remain viewable read-only.
+alter table public.scrapbook_entries add column if not exists archived_at bigint;
 
 create unique index if not exists users_provider_email_uidx
   on public.users (provider, email);
