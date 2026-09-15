@@ -1,6 +1,6 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, updatePartyIdentity, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
+const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, setPartyIdentity, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
 const metadataResolver = require("./metadata-resolver");
 const port = Number(process.env.PORT || 8787);
@@ -52,7 +52,7 @@ const httpServer = http.createServer(async (req, res) => {
       const b=await readJson(req); const email=normalizeEmail(b.email);
       if(!email || !email.includes("@")) {json(res,400,{ok:false,error:"Enter a valid email address."});return;}
       if(!isValidPassword(b.password)) {json(res,400,{ok:false,error:"Password must be at least 8 characters."});return;}
-      const created=await createEmailUser({email,password:b.password,name:b.name});
+      const created=await createEmailUser({email,password:b.password,name:b.name,partyIdentity:b.partyIdentity});
       if(created.error){json(res,409,{ok:false,error:created.error});return;}
       const session=await createSession(created.user.id);
       json(res,200,{ok:true,token:session,user:publicUser(created.user)}); return;
@@ -61,8 +61,11 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/auth/login" && req.method === "POST") {
       const b=await readJson(req); const user=await authenticateEmail(b.email,b.password);
       if(!user){json(res,401,{ok:false,error:"Email or password is incorrect."});return;}
+      // Claim-only: an account that already has a Party Identity keeps the
+      // server copy as the source of truth across devices.
+      const claimed=b.partyIdentity?await setPartyIdentity(user.id,b.partyIdentity,{claimOnly:true}):user;
       const session=await createSession(user.id);
-      json(res,200,{ok:true,token:session,user:publicUser(user)}); return;
+      json(res,200,{ok:true,token:session,user:publicUser(claimed||user)}); return;
     }
 
     if (path === "/api/auth/logout" && req.method === "POST") {
@@ -74,13 +77,6 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,user:publicUser(user)}); return;
     }
 
-    if (path === "/api/account/identity" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      const result=await updatePartyIdentity(user.id,{partyName:b.partyName,partyAvatar:b.partyAvatar});
-      if(result.error){json(res,503,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,user:publicUser(result.user)}); return;
-    }
-
     if (path === "/api/auth/google/exchange" && req.method === "POST") {
       if(!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET){json(res,503,{ok:false,error:"Google sign-in is not configured on this SyncParty server."});return;}
       const b=await readJson(req); if(!b.code || !b.redirectUri){json(res,400,{ok:false,error:"Missing Google authorization data."});return;}
@@ -90,13 +86,34 @@ const httpServer = http.createServer(async (req, res) => {
       if(!infoResp.ok){json(res,401,{ok:false,error:"Google profile could not be read."});return;}
       const info=await infoResp.json(); let user=await getGoogleUser(info.sub);
       if(!user){
-        const created=await createGoogleUser({sub:info.sub,email:info.email,name:info.name});
+        const created=await createGoogleUser({sub:info.sub,email:info.email,name:info.name,partyIdentity:b.partyIdentity});
         user=created.user;
       } else {
+        // Google refresh touches account identity only; Party Identity is then
+        // claimed only when this account has never saved one.
         user=await updateGoogleUser(user.id,{email:info.email,name:info.name});
+        if(b.partyIdentity) user=await setPartyIdentity(user.id,b.partyIdentity,{claimOnly:true})||user;
       }
       const session=await createSession(user.id);
       json(res,200,{ok:true,token:session,user:publicUser(user)}); return;
+    }
+
+    // Party Identity is the social identity shown to other SyncParty users.
+    // GET returns the server copy (source of truth across devices).
+    // POST with claimOnly=true adopts a guest identity for a brand-new account;
+    // POST without it persists an explicit Party Identity change.
+    if (path === "/api/account/identity" && req.method === "GET") {
+      const user=await requireUser(req,res); if(!user)return;
+      json(res,200,{ok:true,user:publicUser(user)}); return;
+    }
+
+    if (path === "/api/account/identity" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return;
+      const b=await readJson(req);
+      const identity={partyName:b.partyName,partyAvatar:b.partyAvatar,partyColor:b.partyColor};
+      if(!b.claimOnly && !String(identity.partyName||"").trim()){json(res,400,{ok:false,error:"Party Name is required."});return;}
+      const updated=await setPartyIdentity(user.id,identity,{claimOnly:!!b.claimOnly});
+      json(res,200,{ok:true,user:publicUser(updated||user)}); return;
     }
 
     if (path === "/api/scrapbook/resolve" && req.method === "POST") {
@@ -115,8 +132,8 @@ const httpServer = http.createServer(async (req, res) => {
       const relationId=u.searchParams.get("relationId")||null;
       const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
       const entries=scope==='shared'
-        ? await scrapbook.listSharedEntries(user.id,relationId,limit,true)
-        : await scrapbook.listPersonalEntries(user.id,limit,true);
+        ? await scrapbook.listSharedEntries(user.id,relationId,limit)
+        : await scrapbook.listPersonalEntries(user.id,limit);
       const relations=await scrapbook.listUserRelations(user.id);
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
@@ -143,39 +160,17 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,entries:out}); return;
     }
 
-    if (path === "/api/scrapbook/reconcile" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      const result=await scrapbook.reconcileEntries(user.id,b.entries);
-      json(res,200,{ok:true,...result}); return;
-    }
-
-    if (path === "/api/scrapbook/entries/archive" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      const result=await scrapbook.mutateEntries(user.id,b.entryIds,"archive",!!b.archived);
-      if(result.error){json(res,503,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,...result}); return;
-    }
-
-    if (path === "/api/scrapbook/entries/remove" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      const result=await scrapbook.mutateEntries(user.id,b.entryIds,"remove",false);
-      if(result.error){json(res,503,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,...result}); return;
-    }
-
     if (path === "/api/scrapbook/relationship" && req.method === "GET") {
       const user=await requireUser(req,res); if(!user)return; const partnerId=u.searchParams.get('partnerId');
       const relation=partnerId?await scrapbook.getRelation(user.id,partnerId):null;
       const invites=await scrapbook.listInvites(user.id);
-      const activeRelation=await scrapbook.getActiveRelationForUser(user.id);
-      json(res,200,{ok:true,relation:await scrapbook.relationView(relation),activeRelation:await scrapbook.relationView(activeRelation),...invites}); return;
+      json(res,200,{ok:true,relation:await scrapbook.relationView(relation),...invites}); return;
     }
 
     if (path === "/api/scrapbook/relationship/invite" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req); const partner=await scrapbook.getUser(b.partnerId);
       if(!partner||partner.id===user.id){json(res,400,{ok:false,error:'Choose a valid partner account.'});return;}
       const result=await scrapbook.createInvite(user.id,partner.id);
-      if(result.error){json(res,409,{ok:false,error:result.error});return;}
       if(result.relation){json(res,200,{ok:true,relation:result.relation});return;}
       json(res,200,{ok:true,invite:result.invite});return;
     }
@@ -183,22 +178,6 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/relationship/respond" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const result=await scrapbook.respondInvite(b.inviteId,user.id,!!b.accept);
-      if(result.error){json(res,404,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,relation:result.relation});return;
-    }
-
-    if (path === "/api/scrapbook/relationship/archive" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      if(!b.relationId){json(res,400,{ok:false,error:'Missing relationId.'});return;}
-      const result=await scrapbook.archiveRelation(b.relationId,user.id);
-      if(result.error){json(res,503,{ok:false,error:result.error});return;}
-      json(res,200,{ok:true,relation:result.relation});return;
-    }
-
-    if (path === "/api/scrapbook/relationship/end" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      if(!b.relationId){json(res,400,{ok:false,error:'Missing relationId.'});return;}
-      const result=await scrapbook.endRelation(b.relationId,user.id);
       if(result.error){json(res,404,{ok:false,error:result.error});return;}
       json(res,200,{ok:true,relation:result.relation});return;
     }

@@ -13,14 +13,23 @@ create table if not exists public.users (
   name text not null,
   avatar text not null default '🦊',
   color text not null default '#54a0ff',
+  -- Party Identity: the identity shown to other SyncParty users. Null means
+  -- "never claimed" so the next sign-in can adopt the guest Party Identity.
+  -- Google/OAuth name+email live in name/email and never write these columns.
   party_name text,
   party_avatar text,
+  party_color text,
   provider text not null check (provider in ('email','google')),
   password_hash text,
   password_salt text,
   google_sub text,
   created_at bigint not null
 );
+
+-- Migration for workspaces created before Party Identity existed.
+alter table public.users add column if not exists party_name text;
+alter table public.users add column if not exists party_avatar text;
+alter table public.users add column if not exists party_color text;
 
 create unique index if not exists users_provider_email_uidx
   on public.users (provider, email);
@@ -45,22 +54,9 @@ create table if not exists public.relations (
   user2_id text not null references public.users(id) on delete cascade,
   created_at bigint not null,
   accepted_at bigint,
-  archived_at bigint,
-  ended_at bigint,
   constraint relations_distinct_users check (user1_id <> user2_id),
   constraint relations_sorted_users check (user1_id < user2_id)
 );
-
--- Added for the "one active Our Story at a time" rule: a relation that has
--- been ended is archived (archived_at set) rather than deleted, so its
--- shared memories/history stay intact and viewable. The existing pair
--- unique index means the SAME two users reuse this one row across an
--- end -> restart cycle instead of inserting a new one.
-alter table public.relations add column if not exists archived_at bigint;
-
-create index if not exists relations_active_lookup_idx
-  on public.relations(user1_id, user2_id)
-  where accepted_at is not null and archived_at is null;
 
 create unique index if not exists relations_pair_uidx
   on public.relations(user1_id,user2_id);
@@ -119,7 +115,6 @@ create table if not exists public.scrapbook_entries (
   last_watched_at bigint not null,
   created_at bigint not null,
   updated_at bigint not null,
-  archived_at bigint,
   constraint scrapbook_scope_check check (
     (scope = 'personal' and relation_id is null)
     or
@@ -208,15 +203,3 @@ alter table public.scrapbook_entries add column if not exists series_episode_cou
 -- Existing rows predate session counting; treat each as at least one
 -- known session rather than leaving a misleading 0.
 update public.scrapbook_entries set session_count = 1 where session_count = 0;
-
-
--- Scrapbook identity/sync/memory-management additive migration.
-alter table public.users add column if not exists party_name text;
-alter table public.users add column if not exists party_avatar text;
-update public.users set party_name = name where party_name is null;
-update public.users set party_avatar = avatar where party_avatar is null;
-alter table public.users alter column party_name set default 'SyncParty user';
-alter table public.users alter column party_avatar set default '🦊';
-alter table public.relations add column if not exists ended_at bigint;
-alter table public.scrapbook_entries add column if not exists archived_at bigint;
-create index if not exists scrapbook_entries_archive_idx on public.scrapbook_entries(user_id, archived_at, last_watched_at desc);

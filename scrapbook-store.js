@@ -44,8 +44,7 @@ function rowToEntry(row) {
     firstWatchedAt: Number(row.first_watched_at || 0),
     lastWatchedAt: Number(row.last_watched_at || 0),
     createdAt: Number(row.created_at || 0),
-    updatedAt: Number(row.updated_at || 0),
-    archivedAt: row.archived_at == null ? null : Number(row.archived_at)
+    updatedAt: Number(row.updated_at || 0)
   };
 }
 
@@ -97,44 +96,23 @@ function normalizeEntry(entry, existing = null) {
 
 async function getUser(userId) {
   const sb = getSupabaseAdmin();
-  let { data, error } = await sb.from("users").select("id,name,email,avatar,color,provider,party_name,party_avatar").eq("id", userId).maybeSingle();
-  if (error && /column .*?(party_name|party_avatar).*?(does not exist|unknown)/i.test(String(error.message || ""))) {
-    const legacy = await sb.from("users").select("id,name,email,avatar,color,provider").eq("id", userId).maybeSingle();
-    data = legacy.data; error = legacy.error;
-  }
+  const { data, error } = await sb.from("users").select("id,name,email,avatar,color,party_name,party_avatar,party_color,provider").eq("id", userId).maybeSingle();
   if (error) throw error;
   return data ? {
-    id: data.id, name: data.name, email: data.email, avatar: data.avatar, color: data.color, provider: data.provider
+    id: data.id, name: data.name, email: data.email, avatar: data.avatar, color: data.color,
+    // Carried through so publicUser() can render Party Identity (never the
+    // Google name) on invitations, relationship and Our Story surfaces.
+    partyName: data.party_name || null, partyAvatar: data.party_avatar || null, partyColor: data.party_color || null,
+    provider: data.provider
   } : null;
 }
 
 async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
-  const fullSelect = "id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at";
-  const archivedSelect = "id,user1_id,user2_id,created_at,accepted_at,archived_at";
-  const baseSelect = "id,user1_id,user2_id,created_at,accepted_at";
-
-  let { data, error } = await sb.from("relations")
-    .select(fullSelect)
+  const { data, error } = await sb.from("relations")
+    .select("id,user1_id,user2_id,created_at,accepted_at")
     .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-
-  // The new Scrapbook relation fields are additive. A live/older Supabase
-  // deployment may not have one or both columns yet; invitation creation
-  // must still work in that environment instead of bubbling a 500 that the
-  // production server masks as the generic "SyncParty server error."
-  if (error && isMissingColumnError(error, "ended_at")) {
-    const legacy = await sb.from("relations")
-      .select(archivedSelect)
-      .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-    data = legacy.data; error = legacy.error;
-  }
-  if (error && isMissingColumnError(error, "archived_at")) {
-    const legacy = await sb.from("relations")
-      .select(baseSelect)
-      .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
-    data = legacy.data; error = legacy.error;
-  }
   if (error) throw error;
   return data || null;
 }
@@ -146,76 +124,33 @@ async function relationView(r) {
     id: r.id,
     users: [publicUser(a), publicUser(b)],
     createdAt: Number(r.created_at || 0),
-    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at),
-    archivedAt: r.archived_at == null ? null : Number(r.archived_at),
-    endedAt: r.ended_at == null ? null : Number(r.ended_at)
+    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at)
   };
-}
-
-function isMissingColumnError(error, col) {
-  return !!error && new RegExp(`column\\s+["']?${col}["']?.*?(does not exist|unknown)`, "i").test(String(error.message || ""));
-}
-
-// "One active Our Story at a time": a user's single active relation, if any
-// (accepted and not archived), regardless of which partner it's with.
-async function getActiveRelationForUser(userId) {
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
-    .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
-    .not("accepted_at", "is", null)
-    .is("archived_at", null)
-    .limit(1)
-    .maybeSingle();
-  if (!error) return data || null;
-  // A deployment that hasn't yet run the archived_at migration (see
-  // supabase-schema.sql) has no "archived" concept at all — every accepted
-  // relation is active there. Retrying without that filter instead of
-  // hard-failing is what actually fixes "SyncParty server error." on Start
-  // Our Story for two brand-new accounts: this query runs on every invite
-  // attempt, so a not-yet-migrated database made the whole feature crash.
-  if (isMissingColumnError(error, "archived_at")) {
-    const retry = await sb.from("relations")
-      .select("id,user1_id,user2_id,created_at,accepted_at")
-      .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
-      .not("accepted_at", "is", null)
-      .limit(1)
-      .maybeSingle();
-    if (retry.error) throw retry.error;
-    return retry.data || null;
-  }
-  throw error;
 }
 
 async function listUserRelations(userId) {
   const sb = getSupabaseAdmin();
-  let { data, error } = await sb.from("relations")
-    .select("id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at")
+  const { data, error } = await sb.from("relations")
+    .select("id,user1_id,user2_id,created_at,accepted_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
-  if (error && /column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
-    const legacy = await sb.from("relations").select("id,user1_id,user2_id,created_at,accepted_at,archived_at").or(`user1_id.eq.${userId},user2_id.eq.${userId}`).order("created_at", { ascending: false });
-    data = legacy.data; error = legacy.error;
-  }
   if (error) throw error;
   return Promise.all((data || []).map(relationView));
 }
 
-async function listPersonalEntries(userId, limit = 150, includeArchived = true) {
+async function listPersonalEntries(userId, limit = 150) {
   const sb = getSupabaseAdmin();
-  let q = sb.from("scrapbook_entries")
+  const { data, error } = await sb.from("scrapbook_entries")
     .select("*")
     .eq("user_id", userId)
     .eq("scope", "personal")
     .order("last_watched_at", { ascending: false })
     .limit(limit);
-  if (!includeArchived) q = q.is("archived_at", null);
-  const { data, error } = await q;
   if (error) throw error;
   return (data || []).map(rowToEntry);
 }
 
-async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = true) {
+async function listSharedEntries(userId, relationId = null, limit = 150) {
   const sb = getSupabaseAdmin();
   let q = sb.from("scrapbook_entries")
     .select("*")
@@ -224,7 +159,6 @@ async function listSharedEntries(userId, relationId = null, limit = 150, include
     .order("last_watched_at", { ascending: false })
     .limit(limit);
   if (relationId) q = q.eq("relation_id", relationId);
-  if (!includeArchived) q = q.is("archived_at", null);
   const { data, error } = await q;
   if (error) throw error;
   return (data || []).map(rowToEntry);
@@ -308,60 +242,10 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
   return rowToEntry(data);
 }
 
-async function mutateEntries(userId, entryIds, mode, archived = true) {
-  const ids = Array.isArray(entryIds) ? entryIds.map(String).filter(Boolean).slice(0, 100) : [];
-  if (!ids.length) return { entries: [] };
-  const sb = getSupabaseAdmin();
-  if (mode === "remove") {
-    const { data, error } = await sb.from("scrapbook_entries").delete().eq("user_id", userId).in("id", ids).select("id");
-    if (error) throw error;
-    return { entries: data || [] };
-  }
-  const patch = { archived_at: archived ? now() : null };
-  const { data, error } = await sb.from("scrapbook_entries").update(patch).eq("user_id", userId).in("id", ids).select("*");
-  if (error) {
-    if (/column .*?archived_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) return { error: "Per-memory archive needs the latest SyncParty database migration." };
-    throw error;
-  }
-  return { entries: (data || []).map(rowToEntry) };
-}
-
-async function reconcileEntries(userId, entries) {
-  const sb = getSupabaseAdmin();
-  const incoming = Array.isArray(entries) ? entries.slice(0, 500) : [];
-  const sourceKeys = incoming.map(e => String(e?.sourceKey || "")).filter(Boolean);
-  if (!sourceKeys.length) return { reconciledAt: now(), entries: [] };
-  const { data, error } = await sb.from("scrapbook_entries")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("scope", "personal")
-    .in("source_key", sourceKeys);
-  if (error) throw error;
-  const byKey = new Map((data || []).map(r => [String(r.source_key), rowToEntry(r)]));
-  const fields=["title","contentType","canonicalTitle","thumbnail","artwork","backdrop","platform","season","episode","progress","status","watchDurationSec","togetherDurationSec","sessionCount","completedAt","metadataProvider","metadataId","metadataYear","storyTotalEpisodes","storyEpisodesCompleted","storyProgress","storyProgressConfidence","seriesEpisodeCounts","firstWatchedAt","lastWatchedAt","archivedAt"];
-  const fingerprint = obj => JSON.stringify(fields.map(k => obj?.[k] ?? null));
-  const result=incoming.map(e=>{
-    const k=String(e?.sourceKey || ""); const server=byKey.get(k);
-    if(!server) return {sourceKey:k,state:"failed",reason:"missing-on-server"};
-    return {sourceKey:k,state:fingerprint(e)===fingerprint(server)?"synced":"failed",reason:fingerprint(e)===fingerprint(server)?null:"mismatch"};
-  });
-  return { reconciledAt: now(), entries: result };
-}
-
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
   const relation = await getRelation(fromUserId, toUserId);
-  if (relation?.accepted_at && !relation.archived_at) return { relation: await relationView(relation) };
-  // "One active Our Story at a time": neither party may invite/be invited
-  // while already in an active (accepted, unarchived) story with someone
-  // else. A pre-existing (possibly archived) relation with THIS SAME
-  // partner is fine — that's a restart, handled in respondInvite.
-  const [fromActive, toActive] = await Promise.all([
-    getActiveRelationForUser(fromUserId),
-    getActiveRelationForUser(toUserId)
-  ]);
-  if (fromActive && !(relation && fromActive.id === relation.id)) return { error: "You already have an active Our Story. End it before starting a new one." };
-  if (toActive && !(relation && toActive.id === relation.id)) return { error: "They already have an active Our Story with someone else." };
+  if (relation?.accepted_at) return { relation: await relationView(relation) };
   const { data: existing, error: findError } = await sb.from("invites")
     .select("*").eq("from_user_id", fromUserId).eq("to_user_id", toUserId).eq("status", "pending").maybeSingle();
   if (findError) throw findError;
@@ -404,24 +288,6 @@ async function respondInvite(inviteId, userId, accept) {
   if (findError) throw findError;
   if (!inv) return { error: "Invitation no longer exists." };
   const respondedAt = now();
-  if (accept) {
-    // Race guard: re-verify eligibility right before committing, since
-    // either side may have started (or been placed into) an active story
-    // with someone else in the time between this invite being shown and
-    // the user clicking Accept.
-    const preExisting = await getRelation(inv.from_user_id, inv.to_user_id);
-    const alreadyActiveWithEachOther = !!(preExisting?.accepted_at && !preExisting.archived_at);
-    if (!alreadyActiveWithEachOther) {
-      const [fromActive, toActive] = await Promise.all([
-        getActiveRelationForUser(inv.from_user_id),
-        getActiveRelationForUser(inv.to_user_id)
-      ]);
-      if (fromActive || toActive) {
-        await sb.from("invites").update({ status: "declined", responded_at: respondedAt }).eq("id", inviteId);
-        return { error: "This invitation is no longer available — one of you already has an active Our Story." };
-      }
-    }
-  }
   const { error: updateError } = await sb.from("invites").update({ status: accept ? "accepted" : "declined", responded_at: respondedAt }).eq("id", inviteId);
   if (updateError) throw updateError;
   if (!accept) return { relation: null };
@@ -429,64 +295,18 @@ async function respondInvite(inviteId, userId, accept) {
   const existing = await getRelation(inv.from_user_id, inv.to_user_id);
   let relation = existing;
   if (!relation) {
-    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt, archived_at: null };
+    const row = { id: id("rel"), user1_id: ids[0], user2_id: ids[1], created_at: respondedAt, accepted_at: respondedAt };
     const { data, error } = await sb.from("relations").insert(row).select("*").maybeSingle();
     if (error) {
       if (error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id);
-      else if (isMissingColumnError(error, "archived_at")) {
-        const legacyRow = { ...row }; delete legacyRow.archived_at;
-        const retry = await sb.from("relations").insert(legacyRow).select("*").maybeSingle();
-        if (retry.error) { if (retry.error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id); else throw retry.error; }
-        else relation = retry.data;
-      } else throw error;
+      else throw error;
     } else relation = data;
-  } else if (!relation.accepted_at || relation.archived_at) {
-    // Either a brand-new acceptance, or restarting a previously-archived
-    // story with the SAME partner — reuse the row (the pair unique index
-    // means a second row for this exact pair can never be inserted).
-    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt, archived_at: null }).eq("id", relation.id).select("*").maybeSingle();
-    if (error) {
-      if (isMissingColumnError(error, "archived_at")) {
-        const retry = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
-        if (retry.error) throw retry.error;
-        relation = retry.data;
-      } else throw error;
-    } else relation = data;
+  } else if (!relation.accepted_at) {
+    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
+    if (error) throw error;
+    relation = data;
   }
   return { relation: await relationView(relation) };
-}
-
-async function archiveRelation(relationId, userId) {
-  const sb = getSupabaseAdmin();
-  const { data: rel, error: findError } = await sb.from("relations").select("*").eq("id", relationId).maybeSingle();
-  if (findError) throw findError;
-  if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
-  if (rel.archived_at) return { relation: await relationView(rel) };
-  const { data, error } = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
-  if (!error) return { relation: await relationView(data) };
-  if (isMissingColumnError(error, "archived_at")) return { error: "Archiving Our Story isn't available yet — please run the latest database migration." };
-  throw error;
-}
-
-// Archives a relation (does not delete it) so its shared memories remain
-// viewable/read-only, while freeing both participants to start a new Our
-// Story. Idempotent: ending an already-archived story just returns its
-// current (already-archived) state as success, so two near-simultaneous
-// "End Our Story" clicks — from either or both users — never error.
-async function endRelation(relationId, userId) {
-  const sb = getSupabaseAdmin();
-  const { data: rel, error: findError } = await sb.from("relations").select("*").eq("id", relationId).maybeSingle();
-  if (findError) throw findError;
-  if (!rel || (rel.user1_id !== userId && rel.user2_id !== userId)) return { error: "Story not found." };
-  if (rel.archived_at) return { relation: await relationView(rel) };
-  const { data, error } = await sb.from("relations").update({ archived_at: now(), ended_at: now() }).eq("id", relationId).select("*").maybeSingle();
-  if (!error) return { relation: await relationView(data) };
-  if (/column .*?ended_at.*?(does not exist|unknown)/i.test(String(error.message || ""))) {
-    const retry = await sb.from("relations").update({ archived_at: now() }).eq("id", relationId).select("*").maybeSingle();
-    if (!retry.error) return { relation: await relationView(retry.data) };
-  }
-  if (isMissingColumnError(error, "archived_at")) return { error: "Ending Our Story isn't available yet — please run the latest database migration." };
-  throw error;
 }
 
 async function getHighlights(userId) {
@@ -506,7 +326,6 @@ module.exports = {
   getUser,
   getRelation,
   relationView,
-  getActiveRelationForUser,
   listUserRelations,
   listPersonalEntries,
   listSharedEntries,
@@ -514,10 +333,6 @@ module.exports = {
   createInvite,
   listInvites,
   respondInvite,
-  endRelation,
-  archiveRelation,
-  mutateEntries,
-  reconcileEntries,
   getHighlights,
   rowToInvite
 };
