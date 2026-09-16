@@ -27,7 +27,6 @@ function rowToEntry(row) {
     platform: row.platform,
     season: row.season == null ? null : Number(row.season),
     episode: row.episode == null ? null : Number(row.episode),
-    episodeTitle: row.episode_title || null,
     progress: Number(row.progress || 0),
     status: row.status,
     watchDurationSec: Number(row.watch_duration_sec || 0),
@@ -45,8 +44,7 @@ function rowToEntry(row) {
     firstWatchedAt: Number(row.first_watched_at || 0),
     lastWatchedAt: Number(row.last_watched_at || 0),
     createdAt: Number(row.created_at || 0),
-    updatedAt: Number(row.updated_at || 0),
-    archivedAt: row.archived_at == null ? null : Number(row.archived_at)
+    updatedAt: Number(row.updated_at || 0)
   };
 }
 
@@ -65,14 +63,8 @@ function normalizeEntry(entry, existing = null) {
       : (existing?.artwork_candidates || []),
     thumbnail: entry.thumbnail ? String(entry.thumbnail).slice(0, 2000) : (existing?.thumbnail || null),
     platform: String(entry.platform || existing?.platform || "").slice(0, 80),
-    // entry.season/episode arrive as null for movies; Number(null) is 0 and
-    // Number.isFinite(0) is true, so guard against null explicitly or every
-    // movie would be written as "season 0".
-    season: entry.season != null && Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
-    episode: entry.episode != null && Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
-    // Never overwrite a known episode name with null: a later save from a
-    // page without JSON-LD must not erase a title we already resolved.
-    episode_title: entry.episodeTitle ? String(entry.episodeTitle).slice(0, 240) : (existing?.episode_title ?? null),
+    season: Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
+    episode: Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
     progress: Math.max(0, Math.min(1, Number(entry.progress) || Number(existing?.progress || 0))),
     status: ["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching"),
     watch_duration_sec: existing
@@ -104,28 +96,22 @@ function normalizeEntry(entry, existing = null) {
 
 async function getUser(userId) {
   const sb = getSupabaseAdmin();
-  // party_name/party_avatar/party_color must be selected here too, otherwise
-  // publicUser() below would fall back to the Google name on every
-  // party-facing surface (Our Story, invitations, relationship UI).
   const { data, error } = await sb.from("users").select("id,name,email,avatar,color,party_name,party_avatar,party_color,provider").eq("id", userId).maybeSingle();
   if (error) throw error;
   return data ? {
     id: data.id, name: data.name, email: data.email, avatar: data.avatar, color: data.color,
+    // Carried through so publicUser() can render Party Identity (never the
+    // Google name) on invitations, relationship and Our Story surfaces.
     partyName: data.party_name || null, partyAvatar: data.party_avatar || null, partyColor: data.party_color || null,
     provider: data.provider
   } : null;
 }
 
-// archived_at / ended_at are additive columns. Ending or archiving an Our
-// Story never deletes the relation or any shared memory — it only stamps the
-// relation so it stops being the ONE active story and becomes read-only.
-const RELATION_COLUMNS = "id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at";
-
 async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select(RELATION_COLUMNS)
+    .select("id,user1_id,user2_id,created_at,accepted_at")
     .eq("user1_id", ids[0]).eq("user2_id", ids[1]).maybeSingle();
   if (error) throw error;
   return data || null;
@@ -138,40 +124,33 @@ async function relationView(r) {
     id: r.id,
     users: [publicUser(a), publicUser(b)],
     createdAt: Number(r.created_at || 0),
-    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at),
-    archivedAt: r.archived_at == null ? null : Number(r.archived_at),
-    endedAt: r.ended_at == null ? null : Number(r.ended_at)
+    acceptedAt: r.accepted_at == null ? null : Number(r.accepted_at)
   };
 }
 
 async function listUserRelations(userId) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("relations")
-    .select(RELATION_COLUMNS)
+    .select("id,user1_id,user2_id,created_at,accepted_at")
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
   if (error) throw error;
   return Promise.all((data || []).map(relationView));
 }
 
-// includeArchived lets the Scrapbook show archived memories read-only in its
-// "Archived" filter. Default stays active-only so existing callers are
-// unaffected.
-async function listPersonalEntries(userId, limit = 150, includeArchived = true) {
+async function listPersonalEntries(userId, limit = 150) {
   const sb = getSupabaseAdmin();
-  let q = sb.from("scrapbook_entries")
+  const { data, error } = await sb.from("scrapbook_entries")
     .select("*")
     .eq("user_id", userId)
     .eq("scope", "personal")
     .order("last_watched_at", { ascending: false })
     .limit(limit);
-  if (!includeArchived) q = q.is("archived_at", null);
-  const { data, error } = await q;
   if (error) throw error;
   return (data || []).map(rowToEntry);
 }
 
-async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = true) {
+async function listSharedEntries(userId, relationId = null, limit = 150) {
   const sb = getSupabaseAdmin();
   let q = sb.from("scrapbook_entries")
     .select("*")
@@ -180,7 +159,6 @@ async function listSharedEntries(userId, relationId = null, limit = 150, include
     .order("last_watched_at", { ascending: false })
     .limit(limit);
   if (relationId) q = q.eq("relation_id", relationId);
-  if (!includeArchived) q = q.is("archived_at", null);
   const { data, error } = await q;
   if (error) throw error;
   return (data || []).map(rowToEntry);
@@ -226,7 +204,7 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // An existing deployment may not yet have the optional artwork/title columns.
     // Retry only the legacy-compatible fields; anime still correctly requires the
     // existing kind/content_type constraint to permit it.
-    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
       // Every column named in the regex above must be stripped here too —
       // this list previously only dropped the original three (content_type/
@@ -247,7 +225,6 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
       delete legacyRow.metadata_provider;
       delete legacyRow.metadata_id;
       delete legacyRow.metadata_year;
-      delete legacyRow.episode_title;
       delete legacyRow.story_total_episodes;
       delete legacyRow.story_episodes_completed;
       delete legacyRow.story_progress;
@@ -332,98 +309,6 @@ async function respondInvite(inviteId, userId, accept) {
   return { relation: await relationView(relation) };
 }
 
-// Returns the single active Our Story for a user, if any. "Active" means
-// accepted and neither archived nor ended, which is what enforces the
-// one-active-story-at-a-time rule and blocks third-party invitations.
-async function getActiveRelationRow(userId) {
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("relations")
-    .select(RELATION_COLUMNS)
-    .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
-    .order("created_at", { ascending: false });
-  if (error) throw error;
-  return (data || []).find(r => r.accepted_at && r.archived_at == null && r.ended_at == null) || null;
-}
-
-// Ends or archives an Our Story. Both are non-destructive: the relation row
-// and every shared scrapbook_entries row stay exactly as they are, so the
-// story remains viewable read-only and personal memories are untouched. After
-// this the user is free to start a new Our Story with someone else.
-async function closeRelation(relationId, userId, mode = "end") {
-  const sb = getSupabaseAdmin();
-  const { data: row, error: findError } = await sb.from("relations")
-    .select(RELATION_COLUMNS).eq("id", String(relationId)).maybeSingle();
-  if (findError) throw findError;
-  if (!row) return { error: "That story no longer exists." };
-  if (![row.user1_id, row.user2_id].includes(String(userId))) return { error: "You are not part of this story." };
-  if (row.archived_at != null || row.ended_at != null) return { relation: await relationView(row) };
-
-  const t = now();
-  // Ending also archives, so an ended story still shows up in the archived
-  // list as read-only rather than disappearing.
-  const patch = mode === "archive" ? { archived_at: t } : { archived_at: t, ended_at: t };
-  const { data, error } = await sb.from("relations").update(patch).eq("id", row.id).select(RELATION_COLUMNS).maybeSingle();
-  if (error) throw error;
-
-  // Any still-pending invitation tied to this pair is stale once the story is
-  // closed; leaving it pending would block a fresh Our Story later.
-  const { error: inviteError } = await sb.from("invites")
-    .update({ status: "declined", responded_at: t })
-    .eq("status", "pending")
-    .or(`and(from_user_id.eq.${row.user1_id},to_user_id.eq.${row.user2_id}),and(from_user_id.eq.${row.user2_id},to_user_id.eq.${row.user1_id})`);
-  if (inviteError) throw inviteError;
-
-  return { relation: await relationView(data || { ...row, ...patch }) };
-}
-
-// Compares what the client believes it has against what is actually stored,
-// so the Sync & Backup panel can show real confirmed/pending/failed state
-// instead of guessing. Read-only: it never writes entries.
-async function reconcileEntries(userId, entries = []) {
-  const stored = await listPersonalEntries(userId, 300);
-  const byKey = new Map(stored.map(e => [e.sourceKey, e]));
-  const out = [];
-  for (const candidate of (Array.isArray(entries) ? entries.slice(0, 500) : [])) {
-    const sourceKey = String(candidate?.sourceKey || "");
-    if (!sourceKey) continue;
-    const match = byKey.get(sourceKey);
-    if (!match) {
-      out.push({ sourceKey, state: "pending" });
-      continue;
-    }
-    // Confirmed means the server has at least as much watch time as the
-    // client does; otherwise the client still holds unsent progress.
-    const clientSec = Math.max(0, Number(candidate.watchDurationSec) || 0);
-    const behind = clientSec > (Number(match.watchDurationSec) || 0) + 1;
-    out.push({ sourceKey, state: behind ? "pending" : "synced", id: match.id });
-  }
-  return { entries: out, reconciledAt: now(), storedCount: stored.length };
-}
-
-// Archive/restore or remove specific entries the user owns. Archiving keeps
-// the memory and only hides it from the default timeline.
-async function setEntriesArchived(userId, entryIds, archived) {
-  const ids = (Array.isArray(entryIds) ? entryIds : []).map(String).filter(Boolean).slice(0, 500);
-  if (!ids.length) return { entries: [] };
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("scrapbook_entries")
-    .update({ archived_at: archived ? now() : null, updated_at: now() })
-    .eq("user_id", userId)
-    .in("id", ids)
-    .select("*");
-  if (error) throw error;
-  return { entries: (data || []).map(rowToEntry) };
-}
-
-async function removeEntries(userId, entryIds) {
-  const ids = (Array.isArray(entryIds) ? entryIds : []).map(String).filter(Boolean).slice(0, 500);
-  if (!ids.length) return { removed: 0 };
-  const sb = getSupabaseAdmin();
-  const { error } = await sb.from("scrapbook_entries").delete().eq("user_id", userId).in("id", ids);
-  if (error) throw error;
-  return { removed: ids.length };
-}
-
 async function getHighlights(userId) {
   const entries = await listPersonalEntries(userId, 300);
   const totalSec = entries.reduce((n, e) => n + (e.watchDurationSec || 0), 0);
@@ -442,11 +327,6 @@ module.exports = {
   getRelation,
   relationView,
   listUserRelations,
-  getActiveRelationRow,
-  closeRelation,
-  reconcileEntries,
-  setEntriesArchived,
-  removeEntries,
   listPersonalEntries,
   listSharedEntries,
   upsertEntry,

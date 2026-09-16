@@ -35,10 +35,8 @@ function now() {
   return Date.now();
 }
 
-// Party Identity sanitizers. Party Name / emoji PFP / party color are the
-// *social* identity shown to other SyncParty users and are NEVER derived from
-// Google/OAuth data. The emoji PFP set itself is untouched — the client still
-// owns the picker; the server only stores whatever emoji it is given.
+// Party Identity sanitizers. Party Name/PFP/color are the *social* identity
+// shown to other SyncParty users and are NEVER derived from Google/OAuth data.
 function sanitizePartyName(name) {
   return String(name || "").trim().slice(0, 24);
 }
@@ -57,7 +55,7 @@ function sanitizePartyColor(color) {
 //   - name/avatar/color are ALWAYS the Party Identity (legacy field names kept
 //     so existing consumers keep working without any change),
 //   - Google/OAuth identity is exposed separately as googleName/googleEmail and
-//     must only ever be rendered inside Account settings.
+//     must only be rendered inside Account settings.
 function publicUser(user) {
   if (!user) return null;
   const partyName = sanitizePartyName(user.partyName) || sanitizePartyName(user.name) || "SyncParty user";
@@ -77,41 +75,6 @@ function publicUser(user) {
     googleEmail: user.email || null,
     provider: user.provider || "email"
   };
-}
-
-// Normalizes an incoming Party Identity into column form, dropping anything
-// blank or malformed so a partial update never clears a saved value.
-function normalizePartyIdentity(identity) {
-  const out = { party_name: null, party_avatar: null, party_color: null };
-  if (!identity || typeof identity !== "object") return out;
-  out.party_name = sanitizePartyName(identity.partyName ?? identity.name) || null;
-  out.party_avatar = sanitizePartyAvatar(identity.partyAvatar ?? identity.avatar) || null;
-  out.party_color = sanitizePartyColor(identity.partyColor ?? identity.color) || null;
-  return out;
-}
-
-// Saves a Party Identity.
-//   claimOnly: true  -> only adopts the identity if the account has never saved
-//                       one (the guest → signed-in claim). An account that
-//                       already has a Party Identity keeps the server copy as
-//                       the source of truth across devices.
-//   claimOnly: false -> an explicit user-driven change from the profile editor.
-async function setPartyIdentity(userId, identity, { claimOnly = false } = {}) {
-  const sb = getSupabaseAdmin();
-  const current = await getUserById(userId);
-  if (!current) return null;
-  if (claimOnly && sanitizePartyName(current.partyName)) return current;
-
-  const next = normalizePartyIdentity(identity);
-  const patch = {};
-  if (next.party_name) patch.party_name = next.party_name;
-  if (next.party_avatar) patch.party_avatar = next.party_avatar;
-  if (next.party_color) patch.party_color = next.party_color;
-  if (!Object.keys(patch).length) return current;
-
-  const { data, error } = await sb.from("users").update(patch).eq("id", String(userId)).select("*").maybeSingle();
-  if (error) throw error;
-  return rowToUser(data);
 }
 
 function rowToUser(row) {
@@ -137,8 +100,6 @@ async function createEmailUser({ email, password, name, partyIdentity }) {
   const sb = getSupabaseAdmin();
   email = normalizeEmail(email);
   const hp = hashPassword(password);
-  // A brand-new account adopts the Party Identity the user already had as a
-  // guest, so nothing visibly changes after signing in.
   const claimed = normalizePartyIdentity(partyIdentity);
   const user = {
     id: id("user"),
@@ -221,9 +182,9 @@ async function createGoogleUser({ sub, email, name, partyIdentity }) {
   return { user: rowToUser(data) };
 }
 
-// Refreshes the Google/OAuth identity only. It deliberately patches just
-// email + name and must never touch party_name/party_avatar/party_color,
-// otherwise every sign-in would silently overwrite the user's Party Identity.
+// Refreshes ONLY the Google/OAuth identity columns. party_name/party_avatar/
+// party_color are deliberately absent from this patch: a Google profile change
+// must never overwrite the Party Identity.
 async function updateGoogleUser(userId, { email, name }) {
   const sb = getSupabaseAdmin();
   const patch = {
@@ -233,6 +194,40 @@ async function updateGoogleUser(userId, { email, name }) {
   const { data, error } = await sb.from("users").update(patch).eq("id", userId).select("*").maybeSingle();
   if (error) throw error;
   return rowToUser(data);
+}
+
+function normalizePartyIdentity(identity) {
+  return {
+    party_name: sanitizePartyName(identity?.partyName ?? identity?.name) || null,
+    party_avatar: sanitizePartyAvatar(identity?.partyAvatar ?? identity?.avatar) || null,
+    party_color: sanitizePartyColor(identity?.partyColor ?? identity?.color) || null
+  };
+}
+
+/**
+ * Writes the Party Identity for an account.
+ *
+ * claimOnly=true implements the "brand-new signed-in account" rule: the guest
+ * Party Identity is adopted only when the account has no saved Party Name yet.
+ * For an account that already has one, the stored server identity stays the
+ * source of truth across devices and the call is a no-op.
+ */
+async function setPartyIdentity(userId, identity, { claimOnly = false } = {}) {
+  const existing = await getUserById(userId);
+  if (!existing) return null;
+  if (claimOnly && sanitizePartyName(existing.partyName)) return existing;
+
+  const next = normalizePartyIdentity(identity);
+  const patch = {};
+  if (next.party_name) patch.party_name = next.party_name;
+  if (next.party_avatar) patch.party_avatar = next.party_avatar;
+  if (next.party_color) patch.party_color = next.party_color;
+  if (!Object.keys(patch).length) return existing;
+
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb.from("users").update(patch).eq("id", userId).select("*").maybeSingle();
+  if (error) throw error;
+  return rowToUser(data) || existing;
 }
 
 async function createSession(userId) {
@@ -281,12 +276,12 @@ module.exports = {
   getGoogleUser,
   createGoogleUser,
   updateGoogleUser,
+  setPartyIdentity,
+  normalizePartyIdentity,
   createSession,
   resolveSession,
   revokeSession,
   publicUser,
-  setPartyIdentity,
-  normalizePartyIdentity,
   id,
   token,
   now
