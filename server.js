@@ -1,6 +1,6 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, setPartyIdentity, createSession, resolveSession, revokeSession, publicUser } = require("./auth-store");
+const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
 const metadataResolver = require("./metadata-resolver");
 const port = Number(process.env.PORT || 8787);
@@ -61,10 +61,10 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/auth/login" && req.method === "POST") {
       const b=await readJson(req); const user=await authenticateEmail(b.email,b.password);
       if(!user){json(res,401,{ok:false,error:"Email or password is incorrect."});return;}
-      // Claim-only: an account that already has a Party Identity keeps the
-      // server copy as the source of truth across devices.
-      const claimed=b.partyIdentity?await setPartyIdentity(user.id,b.partyIdentity,{claimOnly:true}):user;
       const session=await createSession(user.id);
+      // claimOnly: adopt the guest Party Identity only if this account has
+      // never saved one. A returning account keeps the server copy.
+      const claimed=b.partyIdentity?await setPartyIdentity(user.id,b.partyIdentity,{claimOnly:true}):user;
       json(res,200,{ok:true,token:session,user:publicUser(claimed||user)}); return;
     }
 
@@ -89,8 +89,8 @@ const httpServer = http.createServer(async (req, res) => {
         const created=await createGoogleUser({sub:info.sub,email:info.email,name:info.name,partyIdentity:b.partyIdentity});
         user=created.user;
       } else {
-        // Google refresh touches account identity only; Party Identity is then
-        // claimed only when this account has never saved one.
+        // Google refresh updates account identity only; Party Identity is
+        // claimed separately and never overwritten by the Google name.
         user=await updateGoogleUser(user.id,{email:info.email,name:info.name});
         if(b.partyIdentity) user=await setPartyIdentity(user.id,b.partyIdentity,{claimOnly:true})||user;
       }
@@ -98,18 +98,15 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,token:session,user:publicUser(user)}); return;
     }
 
-    // Party Identity is the social identity shown to other SyncParty users.
-    // GET returns the server copy (source of truth across devices).
-    // POST with claimOnly=true adopts a guest identity for a brand-new account;
-    // POST without it persists an explicit Party Identity change.
+    // Party Identity: read the account's current Party Name/PFP/color, or save
+    // a change. Google Name/Email are never writable here.
     if (path === "/api/account/identity" && req.method === "GET") {
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,user:publicUser(user)}); return;
     }
 
     if (path === "/api/account/identity" && req.method === "POST") {
-      const user=await requireUser(req,res); if(!user)return;
-      const b=await readJson(req);
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const identity={partyName:b.partyName,partyAvatar:b.partyAvatar,partyColor:b.partyColor};
       if(!b.claimOnly && !String(identity.partyName||"").trim()){json(res,400,{ok:false,error:"Party Name is required."});return;}
       const updated=await setPartyIdentity(user.id,identity,{claimOnly:!!b.claimOnly});
@@ -131,9 +128,11 @@ const httpServer = http.createServer(async (req, res) => {
       const scope=u.searchParams.get("scope")==="shared"?"shared":"personal";
       const relationId=u.searchParams.get("relationId")||null;
       const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
+      // Archived memories stay viewable (read-only) when explicitly requested.
+      const includeArchived=u.searchParams.get("includeArchived")!=="0";
       const entries=scope==='shared'
-        ? await scrapbook.listSharedEntries(user.id,relationId,limit)
-        : await scrapbook.listPersonalEntries(user.id,limit);
+        ? await scrapbook.listSharedEntries(user.id,relationId,limit,includeArchived)
+        : await scrapbook.listPersonalEntries(user.id,limit,includeArchived);
       const relations=await scrapbook.listUserRelations(user.id);
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
@@ -142,8 +141,13 @@ const httpServer = http.createServer(async (req, res) => {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       let relation=null;
       if(b.scope==='shared'){
-        relation=await scrapbook.getRelation(user.id,b.relationId);
-        if(!relation?.accepted_at){json(res,409,{ok:false,error:"Shared Scrapbook is not active."});return;}
+        // The client sends the RELATION id, so it has to be looked up by id.
+        // getRelation() takes two USER ids, so it never matched and every
+        // shared save was rejected with 409 - the watch was then only kept in
+        // the personal scope. Fall back to the caller's one active story when
+        // no id is supplied.
+        relation=b.relationId?await scrapbook.getRelationById(b.relationId):await scrapbook.getActiveRelationRow(user.id);
+        if(!relation?.accepted_at||relation.archived_at!=null||relation.ended_at!=null){json(res,409,{ok:false,error:"Shared Scrapbook is not active."});return;}
         const ids=[relation.user1_id,relation.user2_id];
         if(!ids.includes(user.id)){json(res,403,{ok:false,error:"You are not part of this Shared Scrapbook."});return;}
       }
@@ -170,6 +174,11 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/relationship/invite" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req); const partner=await scrapbook.getUser(b.partnerId);
       if(!partner||partner.id===user.id){json(res,400,{ok:false,error:'Choose a valid partner account.'});return;}
+      // Only ONE active Our Story per user: block third-party invitations
+      // while either side already has an active relationship.
+      const [mineActive,theirsActive]=await Promise.all([scrapbook.getActiveRelationRow(user.id),scrapbook.getActiveRelationRow(partner.id)]);
+      if(mineActive&&![mineActive.user1_id,mineActive.user2_id].includes(partner.id)){json(res,409,{ok:false,error:'You already have an active Our Story. End it before starting a new one.'});return;}
+      if(theirsActive&&![theirsActive.user1_id,theirsActive.user2_id].includes(user.id)){json(res,409,{ok:false,error:'That account already has an active Our Story.'});return;}
       const result=await scrapbook.createInvite(user.id,partner.id);
       if(result.relation){json(res,200,{ok:true,relation:result.relation});return;}
       json(res,200,{ok:true,invite:result.invite});return;
@@ -180,6 +189,39 @@ const httpServer = http.createServer(async (req, res) => {
       const result=await scrapbook.respondInvite(b.inviteId,user.id,!!b.accept);
       if(result.error){json(res,404,{ok:false,error:result.error});return;}
       json(res,200,{ok:true,relation:result.relation});return;
+    }
+
+    // Confirms which locally held memories the server actually has, so the
+    // Sync & Backup panel reports real state. Read-only.
+    if (path === "/api/scrapbook/reconcile" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.reconcileEntries(user.id,b.entries);
+      json(res,200,{ok:true,...result}); return;
+    }
+
+    // Ending or archiving an Our Story is non-destructive: shared memories are
+    // kept and the story stays viewable read-only. Personal memories are never
+    // touched, and the user may start a new Our Story afterwards.
+    if ((path === "/api/scrapbook/relationship/end" || path === "/api/scrapbook/relationship/archive") && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const mode=path.endsWith("/archive")?"archive":"end";
+      const relationId=b.relationId||(await scrapbook.getActiveRelationRow(user.id))?.id;
+      if(!relationId){json(res,404,{ok:false,error:"You do not have an active Our Story."});return;}
+      const result=await scrapbook.closeRelation(relationId,user.id,mode);
+      if(result.error){json(res,404,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,relation:result.relation}); return;
+    }
+
+    if (path === "/api/scrapbook/entries/archive" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.setEntriesArchived(user.id,b.entryIds,!!b.archived);
+      json(res,200,{ok:true,...result}); return;
+    }
+
+    if (path === "/api/scrapbook/entries/remove" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.removeEntries(user.id,b.entryIds);
+      json(res,200,{ok:true,...result}); return;
     }
 
     if (path === "/api/scrapbook/highlights" && req.method === "GET") {
