@@ -25,8 +25,8 @@ function rowToEntry(row) {
     artworkCandidates: Array.isArray(row.artwork_candidates) ? row.artwork_candidates : [],
     canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
-    season: row.season == null ? null : Number(row.season),
-    episode: row.episode == null ? null : Number(row.episode),
+    season: positiveIntOrNull(row.season),
+    episode: positiveIntOrNull(row.episode),
     episodeTitle: row.episode_title || null,
     progress: Number(row.progress || 0),
     status: row.status,
@@ -68,8 +68,11 @@ function normalizeEntry(entry, existing = null) {
     // entry.season/episode arrive as null for movies; Number(null) is 0 and
     // Number.isFinite(0) is true, so guard against null explicitly or every
     // movie would be written as "season 0".
-    season: entry.season != null && Number.isFinite(Number(entry.season)) ? Number(entry.season) : (existing?.season ?? null),
-    episode: entry.episode != null && Number.isFinite(Number(entry.episode)) ? Number(entry.episode) : (existing?.episode ?? null),
+    // Only a positive integer is a real season/episode. Refusing to carry a
+    // legacy 0 forward from `existing` also heals rows already poisoned with
+    // 0 on their next save.
+    season: positiveIntOrNull(entry.season) ?? positiveIntOrNull(existing?.season),
+    episode: positiveIntOrNull(entry.episode) ?? positiveIntOrNull(existing?.episode),
     // Never overwrite a known episode name with null: a later save from a
     // page without JSON-LD must not erase a title we already resolved.
     episode_title: entry.episodeTitle ? String(entry.episodeTitle).slice(0, 240) : (existing?.episode_title ?? null),
@@ -119,7 +122,24 @@ async function getUser(userId) {
 // archived_at / ended_at are additive columns. Ending or archiving an Our
 // Story never deletes the relation or any shared memory — it only stamps the
 // relation so it stops being the ONE active story and becomes read-only.
+// A season/episode number is meaningful only as a POSITIVE integer. 0, "",
+// NaN and negatives all mean "unknown" and must be stored/returned as NULL.
+// Number(null) is 0 and Number.isFinite(0) is true, which is how unknown
+// episodes ended up persisted and rendered as "S0 E0".
+function positiveIntOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && Math.trunc(n) > 0 ? Math.trunc(n) : null;
+}
+
 const RELATION_COLUMNS = "id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at";
+
+// The single source of truth for "is this story the ONE active story?".
+// Active === accepted AND not archived AND not ended. Everything else is
+// history: still readable, never blocking a new story.
+function isActiveRelationRow(row) {
+  return !!(row && row.accepted_at && row.archived_at == null && row.ended_at == null);
+}
 
 async function getRelation(a, b) {
   const ids = [String(a), String(b)].sort();
@@ -282,7 +302,13 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
 async function createInvite(fromUserId, toUserId) {
   const sb = getSupabaseAdmin();
   const relation = await getRelation(fromUserId, toUserId);
-  if (relation?.accepted_at) return { relation: await relationView(relation) };
+  // Only an ACTIVE story short-circuits the invitation. Previously any
+  // accepted row did, including one that had already been ended/archived:
+  // "Start Our Story" then returned the dead relation as if it were live, so
+  // the pair could never start a new story with each other and the UI kept
+  // showing the old story as active. An ended story must be re-invited like
+  // any other, and accepting revives it as a new chapter (see respondInvite).
+  if (isActiveRelationRow(relation)) return { relation: await relationView(relation) };
   const { data: existing, error: findError } = await sb.from("invites")
     .select("*").eq("from_user_id", fromUserId).eq("to_user_id", toUserId).eq("status", "pending").maybeSingle();
   if (findError) throw findError;
@@ -338,8 +364,13 @@ async function respondInvite(inviteId, userId, accept) {
       if (error.code === "23505") relation = await getRelation(inv.from_user_id, inv.to_user_id);
       else throw error;
     } else relation = data;
-  } else if (!relation.accepted_at) {
-    const { data, error } = await sb.from("relations").update({ accepted_at: respondedAt }).eq("id", relation.id).select("*").maybeSingle();
+  } else if (!isActiveRelationRow(relation)) {
+    // Re-accepting after an end/archive starts a NEW chapter on the same
+    // relation row: archived_at/ended_at are cleared so the story is active
+    // again, while every shared memory already attached to it is preserved.
+    const { data, error } = await sb.from("relations")
+      .update({ accepted_at: relation.accepted_at || respondedAt, archived_at: null, ended_at: null })
+      .eq("id", relation.id).select("*").maybeSingle();
     if (error) throw error;
     relation = data;
   }
@@ -356,7 +387,7 @@ async function getActiveRelationRow(userId) {
     .or(`user1_id.eq.${userId},user2_id.eq.${userId}`)
     .order("created_at", { ascending: false });
   if (error) throw error;
-  return (data || []).find(r => r.accepted_at && r.archived_at == null && r.ended_at == null) || null;
+  return (data || []).find(isActiveRelationRow) || null;
 }
 
 // Ends or archives an Our Story. Both are non-destructive: the relation row
@@ -388,6 +419,34 @@ async function closeRelation(relationId, userId, mode = "end") {
   if (inviteError) throw inviteError;
 
   return { relation: await relationView(data || { ...row, ...patch }) };
+}
+
+// Unarchive ( = reopen ) a story the user archived or ended. Non-destructive
+// and symmetric with closeRelation(): it clears the archive/end stamps so the
+// story becomes the active one again. Refused when either side already has a
+// DIFFERENT active story, which keeps the "one active Our Story" rule true.
+async function reopenRelation(relationId, userId) {
+  const sb = getSupabaseAdmin();
+  const { data: row, error: findError } = await sb.from("relations")
+    .select(RELATION_COLUMNS).eq("id", String(relationId)).maybeSingle();
+  if (findError) throw findError;
+  if (!row) return { error: "That story no longer exists." };
+  if (![row.user1_id, row.user2_id].includes(String(userId))) return { error: "You are not part of this story." };
+  if (isActiveRelationRow(row)) return { relation: await relationView(row) };
+  if (!row.accepted_at) return { error: "That story was never accepted." };
+
+  const [mine, theirs] = await Promise.all([
+    getActiveRelationRow(row.user1_id),
+    getActiveRelationRow(row.user2_id)
+  ]);
+  const blocking = [mine, theirs].find(r => r && String(r.id) !== String(row.id));
+  if (blocking) return { error: "One of you already has an active Our Story. End it first." };
+
+  const { data, error } = await sb.from("relations")
+    .update({ archived_at: null, ended_at: null })
+    .eq("id", row.id).select(RELATION_COLUMNS).maybeSingle();
+  if (error) throw error;
+  return { relation: await relationView(data || { ...row, archived_at: null, ended_at: null }) };
 }
 
 // Compares what the client believes it has against what is actually stored,
@@ -464,6 +523,9 @@ module.exports = {
   listUserRelations,
   getActiveRelationRow,
   closeRelation,
+  reopenRelation,
+  isActiveRelationRow,
+  positiveIntOrNull,
   reconcileEntries,
   setEntriesArchived,
   removeEntries,

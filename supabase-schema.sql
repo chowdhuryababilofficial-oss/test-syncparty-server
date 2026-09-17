@@ -1,5 +1,5 @@
 -- SyncParty persistent database for Supabase
--- Version: 0.7.2 (Scrapbook episode experience)
+-- Version: 0.7.3 (Our Story lifecycle + season/episode heal)
 --
 -- SAFE TO RUN AS A WHOLE, on a FRESH database AND on an EXISTING one, and
 -- safe to re-run any number of times.
@@ -260,3 +260,14 @@ $$;
 
 revoke execute on function public.cleanup_expired_syncparty_sessions() from public, anon, authenticated;
 grant execute on function public.cleanup_expired_syncparty_sessions() to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 8. One-time data heal: season/episode 0 means "unknown", not "zero"
+-- ---------------------------------------------------------------------------
+-- Older builds coerced an unknown season/episode to 0 (Number(null) === 0),
+-- which the UI then rendered as "Season 0 / Episode 0". The application code
+-- now stores NULL for unknown, and this statement heals rows written before
+-- that fix. It is idempotent: a second run matches nothing.
+
+update public.scrapbook_entries set season = null where season is not null and season <= 0;
+update public.scrapbook_entries set episode = null where episode is not null and episode <= 0;

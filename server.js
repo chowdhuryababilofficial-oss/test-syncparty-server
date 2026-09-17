@@ -167,8 +167,19 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/relationship" && req.method === "GET") {
       const user=await requireUser(req,res); if(!user)return; const partnerId=u.searchParams.get('partnerId');
       const relation=partnerId?await scrapbook.getRelation(user.id,partnerId):null;
+      // The caller's OWN active story is reported whether or not a partnerId
+      // was supplied. Without this the sidebar could not tell an ended story
+      // from a live one when no partner was in the room, so the badge and the
+      // "one active story" promo guard both went stale after ending a story.
+      const activeRow=await scrapbook.getActiveRelationRow(user.id);
       const invites=await scrapbook.listInvites(user.id);
-      json(res,200,{ok:true,relation:await scrapbook.relationView(relation),...invites}); return;
+      json(res,200,{
+        ok:true,
+        relation:await scrapbook.relationView(relation),
+        activeRelation:await scrapbook.relationView(activeRow),
+        relations:await scrapbook.listUserRelations(user.id),
+        ...invites
+      }); return;
     }
 
     if (path === "/api/scrapbook/relationship/invite" && req.method === "POST") {
@@ -209,6 +220,16 @@ const httpServer = http.createServer(async (req, res) => {
       if(!relationId){json(res,404,{ok:false,error:"You do not have an active Our Story."});return;}
       const result=await scrapbook.closeRelation(relationId,user.id,mode);
       if(result.error){json(res,404,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,relation:result.relation}); return;
+    }
+
+    // Reopening an archived/ended story is the inverse of ending it, and is
+    // refused when either side already has a different active story.
+    if ((path === "/api/scrapbook/relationship/unarchive" || path === "/api/scrapbook/relationship/reopen") && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!b.relationId){json(res,400,{ok:false,error:"Choose a story to reopen."});return;}
+      const result=await scrapbook.reopenRelation(b.relationId,user.id);
+      if(result.error){json(res,409,{ok:false,error:result.error});return;}
       json(res,200,{ok:true,relation:result.relation}); return;
     }
 
