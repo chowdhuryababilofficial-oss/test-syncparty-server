@@ -173,10 +173,16 @@ const httpServer = http.createServer(async (req, res) => {
       // "one active story" promo guard both went stale after ending a story.
       const activeRow=await scrapbook.getActiveRelationRow(user.id);
       const invites=await scrapbook.listInvites(user.id);
+      // The PARTNER's active story is reported too. Without it the client
+      // could only see its own state, so it happily offered "Start Our Story"
+      // to someone who already had one - and the invite was then rejected
+      // with a 409 the user never asked for. Same rule, evaluated early.
+      const partnerActiveRow=partnerId?await scrapbook.getActiveRelationRow(partnerId):null;
       json(res,200,{
         ok:true,
         relation:await scrapbook.relationView(relation),
         activeRelation:await scrapbook.relationView(activeRow),
+        partnerActiveRelation:await scrapbook.relationView(partnerActiveRow),
         relations:await scrapbook.listUserRelations(user.id),
         ...invites
       }); return;

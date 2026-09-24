@@ -163,11 +163,11 @@ alter table public.scrapbook_entries alter column content_type set not null;
 
 alter table public.scrapbook_entries drop constraint if exists scrapbook_entries_kind_check;
 alter table public.scrapbook_entries add constraint scrapbook_entries_kind_check
-  check (kind in ('movie','series','anime'));
+  check (kind in ('movie','series','anime','manual'));
 
 alter table public.scrapbook_entries drop constraint if exists scrapbook_entries_content_type_check;
 alter table public.scrapbook_entries add constraint scrapbook_entries_content_type_check
-  check (content_type in ('movie','series','anime'));
+  check (content_type in ('movie','series','anime','manual'));
 
 alter table public.scrapbook_entries drop constraint if exists scrapbook_scope_check;
 alter table public.scrapbook_entries add constraint scrapbook_scope_check

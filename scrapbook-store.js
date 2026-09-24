@@ -50,13 +50,17 @@ function rowToEntry(row) {
   };
 }
 
+const CONTENT_TYPES = ["movie","series","anime","manual"];
+
 function normalizeEntry(entry, existing = null) {
   const t = now();
   return {
     source_key: String(entry.sourceKey || existing?.source_key || "").slice(0, 180),
     title: String(entry.title || existing?.title || "Untitled").slice(0, 240),
-    kind: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.kind || "movie"),
-    content_type: ["movie","series","anime"].includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
+    // "manual" is a Manual Memory kept with /keep. It is a first-class type
+    // so manually kept content is never mislabelled as movie/series/anime.
+    kind: CONTENT_TYPES.includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.kind || "movie"),
+    content_type: CONTENT_TYPES.includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
     canonical_title: String(entry.canonicalTitle || existing?.canonical_title || entry.title || existing?.title || "Untitled").slice(0,240),
     artwork: entry.artwork ? String(entry.artwork).slice(0,2000) : (existing?.artwork || null),
     backdrop: entry.backdrop ? String(entry.backdrop).slice(0,2000) : (existing?.backdrop || null),
