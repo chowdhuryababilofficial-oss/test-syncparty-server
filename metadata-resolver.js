@@ -29,7 +29,7 @@ async function tmdb(path) {
   const token = process.env.TMDB_API_TOKEN || "";
   if (!token) return null;
   const r = await fetch(`${TMDB_BASE}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
-  if (!r.ok) return null;
+  if (!r.ok) { console.error("[SyncParty TMDB] request failed", r.status, String(path).split("?")[0]); return null; }
   return r.json();
 }
 
@@ -135,9 +135,9 @@ async function resolve(input = {}) {
   let storyProgress = null;
   let storyProgressConfidence = null;
   if (contentType === "movie") {
-    details = (await tmdb(`/movie/${selected.id}?language=en-US`)) || (await tmdb(`/movie/${selected.id}?language=en-US`));
+    details = await tmdb(`/movie/${selected.id}?language=en-US`);
   } else {
-    details = (await tmdb(`/tv/${selected.id}?language=en-US`)) || (await tmdb(`/tv/${selected.id}?language=en-US`));
+    details = await tmdb(`/tv/${selected.id}?language=en-US`);
     if (details?.number_of_seasons) {
       seriesEpisodeCounts = await seasonCounts(selected.id, details.number_of_seasons);
       storyTotalEpisodes = Object.values(seriesEpisodeCounts).reduce((a,b)=>a+b,0);
@@ -165,8 +165,6 @@ async function resolve(input = {}) {
   }
 
   const artworkCandidates = [
-    // The search hit already carries poster/backdrop paths; use them when the
-    // separate details call fails or is rate limited.
     image(details?.poster_path || selected.poster_path, "w780"),
     image(details?.backdrop_path || selected.backdrop_path, "w1280"),
     ...((meta.imageCandidates || []).filter(Boolean))
@@ -183,7 +181,7 @@ async function resolve(input = {}) {
     episode: Number.isInteger(Number(provisional.episode ?? meta.episode)) ? Number(provisional.episode ?? meta.episode) : null,
     episodeTitle,
     artwork: artworkCandidates[0] || null,
-    backdrop: image(details?.backdrop_path || selected.backdrop_path, "w1280") || null,
+    backdrop: image(details?.backdrop_path || selected.backdrop_path, "w1280") || artworkCandidates[0] || null,
     artworkCandidates: artworkCandidates.slice(0, 10),
     storyTotalEpisodes,
     storyEpisodesCompleted,
@@ -194,9 +192,7 @@ async function resolve(input = {}) {
     externalUrl: `https://www.themoviedb.org/${contentType === "movie" ? "movie" : "tv"}/${selected.id}`,
     providerAttribution: "tmdb"
   };
-  // Never cache an artwork-less answer: a transient TMDB failure would
-  // otherwise pin 'no artwork' to this title for the whole cache window.
-  if (value.artwork) cache.set(key, { at: Date.now(), value });
+  cache.set(key, { at: Date.now(), value });
   return value;
 }
 module.exports = { resolve };

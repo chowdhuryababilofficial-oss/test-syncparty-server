@@ -113,6 +113,13 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,user:publicUser(updated||user)}); return;
     }
 
+    if (path === "/api/scrapbook/resolver-check" && req.method === "GET") {
+      // Open this URL in a browser to see whether artwork/identity lookups can work at all.
+      const configured=!!process.env.TMDB_API_TOKEN; let tmdbStatus=null,error=null;
+      if(configured){try{const r=await fetch("https://api.themoviedb.org/3/configuration",{headers:{Authorization:"Bearer "+process.env.TMDB_API_TOKEN}});tmdbStatus=r.status;}catch(e){error=e?.message||String(e);}}
+      json(res,200,{ok:configured&&tmdbStatus===200,configured,tmdbStatus,error}); return;
+    }
+
     if (path === "/api/scrapbook/resolve" && req.method === "POST") {
       const b = await readJson(req);
       const meta = b.meta && typeof b.meta === "object" ? b.meta : {};
