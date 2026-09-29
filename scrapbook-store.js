@@ -8,6 +8,12 @@ function id(prefix = "id") {
 
 function now() { return Date.now(); }
 
+const TMDB_IMG_RE = /image[.]tmdb[.]org[/]t[/]p[/]/;
+const TMDB_BACKDROP_RE = /image[.]tmdb[.]org[/]t[/]p[/]w1280[/]/;
+function tmdbBackdropFrom(list) {
+  return Array.isArray(list) ? (list.find(u => typeof u === "string" && TMDB_BACKDROP_RE.test(u)) || null) : null;
+}
+
 function rowToEntry(row) {
   if (!row) return null;
   return {
@@ -21,7 +27,9 @@ function rowToEntry(row) {
     contentType: row.content_type || row.kind,
     thumbnail: row.thumbnail,
     artwork: row.artwork || row.thumbnail || null,
-    backdrop: row.backdrop || null,
+    // Legacy rows (and deployments missing the backdrop column) still carry the
+    // TMDB w1280 backdrop inside artwork_candidates.
+    backdrop: row.backdrop || tmdbBackdropFrom(row.artwork_candidates) || null,
     artworkCandidates: Array.isArray(row.artwork_candidates) ? row.artwork_candidates : [],
     canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
@@ -52,8 +60,36 @@ function rowToEntry(row) {
 
 const CONTENT_TYPES = ["movie","series","anime","manual"];
 
+// --- artwork provenance -----------------------------------------------------
+// TMDB artwork is canonical. Page-derived images (og:image, site art) may only
+// fill an EMPTY slot or replace other non-TMDB art; they can never override
+// TMDB artwork, and TMDB art always heals a previously stored page image.
+function isTmdbUrl(u) { return TMDB_IMG_RE.test(String(u || "")); }
+function safeImageUrl(u) {
+  const v = String(u == null ? "" : u).trim();
+  return /^https?:[/][/]/i.test(v) && v.length <= 2000 ? v : null;
+}
+function pickArt(incoming, existing) {
+  const next = safeImageUrl(incoming);
+  const old = safeImageUrl(existing);
+  if (!next) return old;
+  if (!old) return next;
+  if (isTmdbUrl(old) && !isTmdbUrl(next)) return old;
+  return next;
+}
+function pickCandidates(incoming, existing) {
+  const next = (Array.isArray(incoming) ? incoming : []).map(safeImageUrl).filter(Boolean).slice(0, 8);
+  const old = (Array.isArray(existing) ? existing : []).map(safeImageUrl).filter(Boolean);
+  if (!next.length) return old;
+  if (old.some(isTmdbUrl) && !next.some(isTmdbUrl)) return old;
+  return next;
+}
+// Integer columns (bigint/integer) reject fractional values outright.
+function toInt(v) { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : 0; }
+
 function normalizeEntry(entry, existing = null) {
   const t = now();
+  const art = pickArt(entry.artwork || entry.thumbnail, existing?.artwork || existing?.thumbnail);
   return {
     source_key: String(entry.sourceKey || existing?.source_key || "").slice(0, 180),
     title: String(entry.title || existing?.title || "Untitled").slice(0, 240),
@@ -62,12 +98,10 @@ function normalizeEntry(entry, existing = null) {
     kind: CONTENT_TYPES.includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.kind || "movie"),
     content_type: CONTENT_TYPES.includes(entry.contentType || entry.kind) ? (entry.contentType || entry.kind) : (existing?.content_type || existing?.kind || "movie"),
     canonical_title: String(entry.canonicalTitle || existing?.canonical_title || entry.title || existing?.title || "Untitled").slice(0,240),
-    artwork: entry.artwork ? String(entry.artwork).slice(0,2000) : (existing?.artwork || null),
-    backdrop: entry.backdrop ? String(entry.backdrop).slice(0,2000) : (existing?.backdrop || null),
-    artwork_candidates: Array.isArray(entry.artworkCandidates) && entry.artworkCandidates.length
-      ? entry.artworkCandidates.slice(0,8).map(u => String(u).slice(0,2000))
-      : (existing?.artwork_candidates || []),
-    thumbnail: entry.thumbnail ? String(entry.thumbnail).slice(0, 2000) : (existing?.thumbnail || null),
+    artwork: art,
+    backdrop: pickArt(entry.backdrop, existing?.backdrop),
+    artwork_candidates: pickCandidates(entry.artworkCandidates, existing?.artwork_candidates),
+    thumbnail: art,
     platform: String(entry.platform || existing?.platform || "").slice(0, 80),
     // entry.season/episode arrive as null for movies; Number(null) is 0 and
     // Number.isFinite(0) is true, so guard against null explicitly or every
@@ -82,29 +116,29 @@ function normalizeEntry(entry, existing = null) {
     episode_title: entry.episodeTitle ? String(entry.episodeTitle).slice(0, 240) : (existing?.episode_title ?? null),
     progress: Math.max(0, Math.min(1, Number(entry.progress) || Number(existing?.progress || 0))),
     status: ["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching"),
-    watch_duration_sec: existing
-      ? Math.max(0, Number(existing.watch_duration_sec || 0) + (Number(entry.watchDurationDeltaSec) || 0))
-      : Math.max(0, Number(entry.watchDurationDeltaSec) || Number(entry.watchDurationSec) || 0),
+    watch_duration_sec: toInt(existing
+      ? Number(existing.watch_duration_sec || 0) + (Number(entry.watchDurationDeltaSec) || 0)
+      : (Number(entry.watchDurationDeltaSec) || Number(entry.watchDurationSec) || 0)),
     // Same delta-accumulation pattern as watch_duration_sec, kept as an
     // entirely separate column — see sampleTogether() in
     // scrapbook-collector.js for exactly what this counts.
-    together_duration_sec: existing
-      ? Math.max(0, Number(existing.together_duration_sec || 0) + (Number(entry.togetherDurationDeltaSec) || 0))
-      : Math.max(0, Number(entry.togetherDurationDeltaSec) || Number(entry.togetherDurationSec) || 0),
-    session_count: Math.max(0, Number(existing?.session_count || 0) + (Number(entry.sessionCountDelta) || 0)) || 1,
+    together_duration_sec: toInt(existing
+      ? Number(existing.together_duration_sec || 0) + (Number(entry.togetherDurationDeltaSec) || 0)
+      : (Number(entry.togetherDurationDeltaSec) || Number(entry.togetherDurationSec) || 0)),
+    session_count: toInt(Number(existing?.session_count || 0) + (Number(entry.sessionCountDelta) || 0)) || 1,
     // Earliest non-null wins — a later re-watch reaching 'completed' again
     // must not overwrite the original completion date.
-    completed_at: existing?.completed_at != null ? existing.completed_at : (Number.isFinite(Number(entry.completedAt)) ? Number(entry.completedAt) : null),
+    completed_at: existing?.completed_at != null ? existing.completed_at : (Number(entry.completedAt) > 0 ? Math.round(Number(entry.completedAt)) : null),
     metadata_provider: String(entry.metadataProvider || existing?.metadata_provider || "").slice(0,40),
     metadata_id: String(entry.metadataId || existing?.metadata_id || "").slice(0,80),
-    metadata_year: Number.isFinite(Number(entry.metadataYear)) ? Number(entry.metadataYear) : (existing?.metadata_year ?? null),
-    story_total_episodes: Math.max(0, Number(entry.storyTotalEpisodes) || Number(existing?.story_total_episodes || 0)),
-    story_episodes_completed: Math.max(0, Number(entry.storyEpisodesCompleted) || Number(existing?.story_episodes_completed || 0)),
+    metadata_year: Number(entry.metadataYear) > 0 ? Math.round(Number(entry.metadataYear)) : (existing?.metadata_year ?? null),
+    story_total_episodes: toInt(Number(entry.storyTotalEpisodes) || Number(existing?.story_total_episodes || 0)),
+    story_episodes_completed: toInt(Number(entry.storyEpisodesCompleted) || Number(existing?.story_episodes_completed || 0)),
     story_progress: entry.storyProgress == null ? (existing?.story_progress ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgress))),
     story_progress_confidence: entry.storyProgressConfidence == null ? (existing?.story_progress_confidence ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgressConfidence))),
     series_episode_counts: entry.seriesEpisodeCounts && typeof entry.seriesEpisodeCounts === "object" ? entry.seriesEpisodeCounts : (existing?.series_episode_counts || null),
-    first_watched_at: Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t),
-    last_watched_at: Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t),
+    first_watched_at: Math.round(Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t)),
+    last_watched_at: Math.round(Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t)),
     updated_at: t
   };
 }
@@ -225,6 +259,7 @@ async function listSharedEntries(userId, relationId = null, limit = 150, include
 }
 
 async function upsertEntry(userId, entry, sharedRelationId = null) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
   const sourceKey = String(entry.sourceKey || "").slice(0, 180);
   if (!sourceKey) return null;
   const scope = sharedRelationId ? `shared:${sharedRelationId}` : "personal";

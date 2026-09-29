@@ -159,9 +159,23 @@ const httpServer = http.createServer(async (req, res) => {
 
     if (path === "/api/scrapbook/entries/bulk" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
-      const entries=Array.isArray(b.entries)?b.entries.slice(0,500):[];
-      const out=[]; for(const e of entries) out.push(await scrapbook.upsertEntry(user.id,e,null));
-      json(res,200,{ok:true,entries:out}); return;
+      // One bad record must never sink the whole batch (or the migration that
+      // sent it): every entry is isolated, and the reply says exactly which
+      // entries were stored and which were not.
+      const all=Array.isArray(b.entries)?b.entries:[];
+      const entries=all.slice(0,500);
+      const out=[]; const failed=[];
+      for(const e of entries){
+        const key=e&&typeof e==='object'?String(e.sourceKey||''):'';
+        try{
+          const saved=await scrapbook.upsertEntry(user.id,e,null);
+          if(saved) out.push(saved); else failed.push({sourceKey:key,error:'Malformed entry.'});
+        }catch(err){
+          console.error('[SyncParty Scrapbook bulk]',key,err?.message||err);
+          failed.push({sourceKey:key,error:err?.message||'Could not store entry.'});
+        }
+      }
+      json(res,200,{ok:true,entries:out,failed,skipped:Math.max(0,all.length-entries.length)}); return;
     }
 
     if (path === "/api/scrapbook/relationship" && req.method === "GET") {
