@@ -328,6 +328,60 @@ function transitionPeerRecord(s) {
     color: s.profile?.color || "#54a0ff"
   };
 }
+// --- presence grace ----------------------------------------------------------
+// A socket closing is a NETWORK event, not a person leaving. The relay used to
+// announce "left" on every close and "joined" on every rejoin, so a Wi-Fi blip,
+// a tab reload, a duplicate/replaced socket or a relay restart all showed up in
+// chat as fake departures/arrivals. A dropped member is now "reconnecting" for
+// PRESENCE_GRACE_MS; only if they do not return is "left" announced.
+const PRESENCE_GRACE_MS = Number(process.env.SP_PRESENCE_GRACE_MS) || 15000;
+const RECENT_MEMBER_MS = Number(process.env.SP_RECENT_MEMBER_MS) || 120000;
+const pendingDepartures = new Map(); // `${room}|${clientId}` -> { timer, record, room, id }
+const recentMembers = new Map();     // `${room}|${clientId}` -> at (room emptied by a drop)
+function rememberMember(room, id) { if (room && id) recentMembers.set(`${room}|${id}`, Date.now()); }
+function forgetMember(room, id) { recentMembers.delete(`${room}|${id}`); }
+function wasRecentMember(room, id) {
+  const at = recentMembers.get(`${room}|${id}`);
+  if (!at) return false;
+  recentMembers.delete(`${room}|${id}`);
+  return Date.now() - at < RECENT_MEMBER_MS;
+}
+function clearPendingDeparture(room, id) {
+  const key = `${room}|${id}`;
+  const d = pendingDepartures.get(key);
+  if (!d) return false;
+  clearTimeout(d.timer);
+  pendingDepartures.delete(key);
+  return true;
+}
+function announceLeft(room, id, name) {
+  if (!rooms.get(room)?.size) return;
+  broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "left", id, name, t: Date.now() } });
+  broadcast(room, { type: "message", payload: { kind: "system", presenceEvent: "left", id, text: `${name} left the party`, t: Date.now() } });
+}
+function startDeparture(room, id, s) {
+  const key = `${room}|${id}`;
+  clearPendingDeparture(room, id);
+  const record = { ...transitionPeerRecord(s), reconnecting: true };
+  const timer = setTimeout(() => {
+    if (pendingDepartures.get(key)?.timer !== timer) return;
+    pendingDepartures.delete(key);
+    broadcastPeers(room);
+    announceLeft(room, id, record.name);
+  }, PRESENCE_GRACE_MS);
+  if (timer.unref) timer.unref();
+  pendingDepartures.set(key, { timer, record, room, id });
+  broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "reconnecting", id, name: record.name, t: Date.now() } });
+}
+function clearRoomDepartures(room, remember) {
+  for (const [key, d] of [...pendingDepartures]) {
+    if (d.room !== room) continue;
+    clearTimeout(d.timer);
+    pendingDepartures.delete(key);
+    if (remember) rememberMember(room, d.id);
+  }
+}
+
 function broadcastPeers(room) {
   const set = rooms.get(room); if (!set) return;
   const t = activeTransition(room);
@@ -335,6 +389,9 @@ function broadcastPeers(room) {
   for (const ws of set) {
     const s = clients.get(ws); if (!s) continue;
     byId.set(s.clientId || s.id, transitionPeerRecord(s));
+  }
+  for (const d of pendingDepartures.values()) {
+    if (d.room === room && !byId.has(d.id)) byId.set(d.id, d.record);
   }
   if (t) {
     for (const [id, meta] of t.participants) if (!byId.has(id)) byId.set(id, { id, ...meta });
@@ -437,7 +494,7 @@ function startNavigationTransition(room, initiator, p) {
   broadcast(room, { type: "message", payload: transitionPayload });
   return t;
 }
-function detachSocket(ws, announce = true, removeClient = true) {
+function detachSocket(ws, announce = true, removeClient = true, explicit = false) {
   const s = clients.get(ws);
   if (!s) return;
   const room = s.room;
@@ -449,8 +506,14 @@ function detachSocket(ws, announce = true, removeClient = true) {
     rooms.get(room).delete(ws);
     if (rooms.get(room).size) {
       if (announce && !gracefulNavigation) {
-        broadcastPeers(room);
-        broadcast(room, { type: "message", payload: { kind: "system", text: `${name} left the party`, t: Date.now() } });
+        if (explicit) {
+          clearPendingDeparture(room, stableId);
+          broadcastPeers(room);
+          announceLeft(room, stableId, name);
+        } else {
+          startDeparture(room, stableId, s);
+          broadcastPeers(room);
+        }
       } else {
         broadcastPeers(room);
       }
@@ -460,6 +523,10 @@ function detachSocket(ws, announce = true, removeClient = true) {
       broadcastPeers(room);
       setTimeout(() => cleanupTransitionParticipant(room, stableId), NAV_DISCONNECT_GRACE_MS).unref();
     } else {
+      // Last socket gone. If it was a drop (relay restart / everyone's network)
+      // remember the members so their rejoin is not announced as a new arrival.
+      clearRoomDepartures(room, true);
+      if (explicit) forgetMember(room, stableId); else rememberMember(room, stableId);
       rooms.delete(room);
       roomTargets.delete(room);
       navigationTransitions.delete(room);
@@ -481,14 +548,21 @@ wss.on("connection", ws => {
     let m; try { m = JSON.parse(raw); } catch { return; }
     const s = clients.get(ws); if (!s) return;
 
+    // Application-level liveness probe. Lets a client detect its OWN half-open
+    // socket quickly (browsers cannot see protocol-level pings).
+    if (m.type === "ping") { send(ws, { type: "pong", t: m.t || Date.now() }); return; }
+
     if (m.type === "join") {
       const room = norm(m.room); if (room.length !== 6) return;
       const clientId = String(m.clientId || "").trim().slice(0, 128);
+      let replacedLiveSocket = false;
 
       // Replace any older live socket belonging to the same browser tab.
       if (clientId) {
         const old = clientSockets.get(clientId);
         if (old && old !== ws) {
+          // Same tab, newer socket (reload / network handover): continuity, not a new arrival.
+          replacedLiveSocket = true;
           detachSocket(old, false);
           try { old.close(4001, "replaced by newer tab connection"); } catch {}
         }
@@ -523,10 +597,13 @@ wss.on("connection", ws => {
       send(ws, { type: "you", id: s.id, clientId: s.clientId });
       send(ws, { type: "room-info", room, targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
       if (existingTransition) sendTransitionState(ws, existingTransition);
+      const returning = clearPendingDeparture(room, s.clientId);
+      const knownMember = returning || replacedLiveSocket || wasRecentMember(room, s.clientId);
       broadcastPeers(room);
+      if (returning) broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "back", id: s.clientId, name: s.profile.name, t: Date.now() } }, ws);
       // During an active navigation handoff, presence is continuous: do not emit
       // a generic joined-party chat line for a reconnecting/newly arrived socket.
-      if (!existingTransition && !wasEmpty) broadcast(room, { type: "message", payload: { kind: "system", text: `${s.profile.name} joined the party`, t: Date.now() } }, ws);
+      if (!existingTransition && !wasEmpty && !knownMember) broadcast(room, { type: "message", payload: { kind: "system", presenceEvent: "joined", id: s.clientId, text: `${s.profile.name} joined the party`, t: Date.now() } }, ws);
       return;
     }
 
@@ -585,7 +662,7 @@ wss.on("connection", ws => {
     }
 
     if (m.type === "leave" && s.room === norm(m.room)) {
-      detachSocket(ws, true);
+      detachSocket(ws, true, true, true);
       try { ws.close(1000, "left room"); } catch {}
       return;
     }
@@ -606,11 +683,12 @@ setInterval(() => {
       }
     }
   }
+  for (const [key, at] of recentMembers) if (Date.now() - at > RECENT_MEMBER_MS) recentMembers.delete(key);
   for (const ws of wss.clients) {
     if (ws.isAlive === false) { ws.terminate(); continue; }
     ws.isAlive = false;
     ws.ping();
   }
-}, 25000).unref();
+}, Number(process.env.SP_HEARTBEAT_MS) || 10000).unref();
 
 httpServer.listen(port, "0.0.0.0", () => console.log(`SyncParty relay listening at http://127.0.0.1:${port}`));
