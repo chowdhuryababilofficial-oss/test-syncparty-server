@@ -271,3 +271,325 @@ grant execute on function public.cleanup_expired_syncparty_sessions() to service
 
 update public.scrapbook_entries set season = null where season is not null and season <= 0;
 update public.scrapbook_entries set episode = null where episode is not null and episode <= 0;
+
+-- ===========================================================================
+-- 9. Scrapbook v2: Story Chapters, shared memories, sittings, journey state
+-- ===========================================================================
+-- STRICTLY ADDITIVE and safe to re-run. Nothing below drops a table or a
+-- column, renames anything, or deletes a legacy scrapbook row. Legacy
+-- shared copies (scope 'shared:<relation>') stay in scrapbook_entries and are
+-- only LINKED to their merged v2 memory by the backfill script
+-- (scripts/scrapbook-v2-backfill.js, run with --dry-run first).
+
+-- 9.1 Story Chapters. A chapter is created when a Story starts or restarts
+-- and is immutable once ended_at is set (enforced by the application and by
+-- the trigger below). Restarting a Story always creates a NEW chapter id.
+create table if not exists public.story_chapters (
+  id text primary key,
+  relation_id text not null references public.relations(id),
+  chapter_no integer not null,
+  started_at bigint not null,
+  ended_at bigint,
+  end_mode text,
+  ended_by text,
+  legacy boolean not null default false,
+  created_at bigint not null
+);
+create unique index if not exists story_chapters_relation_no_idx on public.story_chapters (relation_id, chapter_no);
+create unique index if not exists story_chapters_one_open_idx on public.story_chapters (relation_id) where ended_at is null;
+
+-- A closed chapter can never be changed, reopened or deleted. An open
+-- chapter's only legal change is being closed (ended_at / end_mode /
+-- ended_by); its identity (id, relation, number, start, legacy) is fixed.
+create or replace function public.story_chapters_immutable() returns trigger language plpgsql as $$
+begin
+  if old.ended_at is not null then
+    raise exception 'story chapter % is closed and read-only', old.id using errcode = 'P0001';
+  end if;
+  if tg_op = 'DELETE' then
+    return old;
+  end if;
+  if new.id is distinct from old.id or new.relation_id is distinct from old.relation_id
+     or new.chapter_no is distinct from old.chapter_no or new.started_at is distinct from old.started_at
+     or new.legacy is distinct from old.legacy or new.created_at is distinct from old.created_at then
+    raise exception 'story chapter % identity is immutable', old.id using errcode = 'P0001';
+  end if;
+  return new;
+end $$;
+drop trigger if exists story_chapters_immutable_trg on public.story_chapters;
+create trigger story_chapters_immutable_trg before update or delete on public.story_chapters
+  for each row execute function public.story_chapters_immutable();
+
+-- 9.2 One shared memory per (chapter, episode save key, journey version).
+create table if not exists public.shared_memories (
+  id text primary key,
+  chapter_id text not null references public.story_chapters(id),
+  source_key text not null,
+  journey_key text not null,
+  journey_version integer not null default 1,
+  entry jsonb not null default '{}'::jsonb,
+  together_sec bigint not null default 0,
+  session_count integer not null default 0,
+  first_watched_at bigint,
+  last_watched_at bigint,
+  completed_at bigint,
+  legacy boolean not null default false,
+  created_at bigint not null,
+  updated_at bigint not null
+);
+create unique index if not exists shared_memories_key_idx on public.shared_memories (chapter_id, source_key, journey_version);
+
+create table if not exists public.shared_memory_members (
+  id text primary key,
+  memory_id text not null references public.shared_memories(id),
+  user_id text not null,
+  watch_sec bigint not null default 0,
+  together_sec bigint not null default 0,
+  session_count integer not null default 0,
+  first_watched_at bigint,
+  last_watched_at bigint,
+  updated_at bigint not null
+);
+create unique index if not exists shared_memory_members_idx on public.shared_memory_members (memory_id, user_id);
+
+-- 9.3 Journey state: presentation title, archive/remove, removal requests.
+-- space = 'u:<userId>' (My Scrapbook) or 'c:<chapterId>' (a Story Chapter).
+create table if not exists public.journey_state (
+  id text primary key,
+  space text not null,
+  journey_key text not null,
+  generation integer not null default 1,
+  display_title text,
+  title_edited_by text,
+  title_edited_at bigint,
+  archived_at bigint,
+  removed_at bigint,
+  removed_by text,
+  purge_after bigint,
+  purged_at bigint,
+  removal_state text not null default 'none',
+  removal_requested_by text,
+  removal_requested_at bigint,
+  removal_blocked_until bigint,
+  updated_at bigint not null
+);
+create unique index if not exists journey_state_key_idx on public.journey_state (space, journey_key, generation);
+
+create table if not exists public.journey_member_prefs (
+  id text primary key,
+  space text not null,
+  journey_key text not null,
+  user_id text not null,
+  hidden_at bigint,
+  updated_at bigint not null
+);
+create unique index if not exists journey_member_prefs_idx on public.journey_member_prefs (space, journey_key, user_id);
+
+-- 9.4 Sittings: intents, co-sittings, write-once decisions, idempotent ledger.
+create table if not exists public.sitting_intents (
+  sitting_id text primary key,
+  user_id text not null,
+  source_key text not null,
+  room_id text,
+  playing boolean not null default false,
+  first_seen_at bigint not null,
+  last_seen_at bigint not null
+);
+create index if not exists sitting_intents_lookup_idx on public.sitting_intents (source_key, room_id, last_seen_at);
+
+create table if not exists public.co_sittings (
+  id text primary key,
+  chapter_id text not null references public.story_chapters(id),
+  source_key text not null,
+  opened_at bigint not null,
+  last_active_at bigint not null,
+  applied_together_sec bigint not null default 0,
+  memory_id text
+);
+create index if not exists co_sittings_lookup_idx on public.co_sittings (chapter_id, source_key, last_active_at);
+
+create table if not exists public.sitting_decisions (
+  sitting_id text primary key,
+  user_id text not null,
+  source_key text not null,
+  destination text not null check (destination in ('PERSONAL','SHARED')),
+  chapter_id text,
+  co_sitting_id text,
+  reason text,
+  decided_at bigint not null,
+  last_active_at bigint not null
+);
+create index if not exists sitting_decisions_user_idx on public.sitting_decisions (user_id, source_key, last_active_at);
+
+create table if not exists public.sitting_ledger (
+  sitting_id text primary key,
+  user_id text not null,
+  destination text not null,
+  target_id text not null,
+  co_sitting_id text,
+  last_seq integer not null default 0,
+  watch_sec_cum bigint not null default 0,
+  together_sec_cum bigint not null default 0,
+  interval_start bigint not null,
+  interval_end bigint not null,
+  applied_watch_sec bigint not null default 0,
+  applied_together_sec bigint not null default 0,
+  applied_sessions integer not null default 0,
+  updated_at bigint not null
+);
+create index if not exists sitting_ledger_target_idx on public.sitting_ledger (target_id, user_id);
+
+-- 9.5 Tombstones, events, moments, maintenance.
+create table if not exists public.memory_tombstones (
+  id text primary key,
+  space text not null,
+  journey_key text not null,
+  generation integer not null,
+  source_keys jsonb not null default '[]'::jsonb,
+  purged_at bigint not null
+);
+create table if not exists public.memory_events (
+  id text primary key,
+  space text not null,
+  journey_key text,
+  actor_id text,
+  kind text not null,
+  payload jsonb not null default '{}'::jsonb,
+  at bigint not null
+);
+create index if not exists memory_events_space_idx on public.memory_events (space, at);
+create table if not exists public.moment_seen (
+  id text primary key,
+  user_id text not null,
+  moment_id text not null,
+  seen_at bigint not null
+);
+create unique index if not exists moment_seen_idx on public.moment_seen (user_id, moment_id);
+create table if not exists public.maintenance_runs (
+  id text primary key,
+  kind text not null,
+  started_at bigint not null,
+  finished_at bigint,
+  report jsonb not null default '{}'::jsonb
+);
+create table if not exists public.maintenance_lease (
+  name text primary key,
+  holder text not null,
+  until_at bigint not null
+);
+
+-- 9.6 Additive columns on legacy scrapbook rows (links, twin flag).
+alter table public.scrapbook_entries add column if not exists migrated_to_shared_id text;
+alter table public.scrapbook_entries add column if not exists twin_of_shared_id text;
+alter table public.scrapbook_entries add column if not exists twin_class text;
+
+-- My Scrapbook journey generations > 1 live under scope 'personal:v<n>' so a
+-- removed generation is never overwritten. This WIDENS the existing check
+-- (every previously valid row stays valid).
+alter table public.scrapbook_entries drop constraint if exists scrapbook_scope_check;
+alter table public.scrapbook_entries add constraint scrapbook_scope_check
+  check (scope = 'personal' or scope like 'personal:v%' or scope like 'shared:%');
+
+alter table public.story_chapters enable row level security;
+alter table public.shared_memories enable row level security;
+alter table public.shared_memory_members enable row level security;
+alter table public.journey_state enable row level security;
+alter table public.journey_member_prefs enable row level security;
+alter table public.sitting_intents enable row level security;
+alter table public.co_sittings enable row level security;
+alter table public.sitting_decisions enable row level security;
+alter table public.sitting_ledger enable row level security;
+alter table public.memory_tombstones enable row level security;
+alter table public.memory_events enable row level security;
+alter table public.moment_seen enable row level security;
+alter table public.maintenance_runs enable row level security;
+alter table public.maintenance_lease enable row level security;
+
+-- Purge / expiry / ledger compaction run in the Node server (boot, every 6 h,
+-- and at most hourly from the Scrapbook list route) under the
+-- maintenance_lease row, so only one instance runs them at a time.
+
+-- ---------------------------------------------------------------------------
+-- 9.7 Multi-instance safety: cross-instance locks + atomic functions
+-- ---------------------------------------------------------------------------
+-- Several Node instances may serve the same database. Critical Scrapbook v2
+-- sections (sitting decisions, shared saves, journey actions, purge) hold a
+-- row in scrapbook_locks (acquire = INSERT on the primary key, or steal an
+-- EXPIRED row with one conditional UPDATE; renewed while held, released by
+-- holder). The functions below make the remaining multi-row steps atomic so
+-- correctness never depends on the lease alone. All are idempotent to
+-- (re)create and are callable by service_role only.
+create table if not exists public.scrapbook_locks (
+  key text primary key,
+  holder text not null,
+  until_at bigint not null
+);
+alter table public.scrapbook_locks enable row level security;
+
+-- totals += deltas (clamped at 0) as ONE statement.
+create or replace function public.sp_scrapbook_bump_totals(
+  p_table text, p_id text, p_watch bigint default 0, p_together bigint default 0, p_sessions integer default 0, p_at bigint default 0
+) returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  if p_table = 'shared_memory_members' then
+    update public.shared_memory_members set
+      watch_sec = greatest(0, watch_sec + coalesce(p_watch, 0)),
+      together_sec = greatest(0, together_sec + coalesce(p_together, 0)),
+      session_count = greatest(0, session_count + coalesce(p_sessions, 0)),
+      last_watched_at = greatest(coalesce(last_watched_at, 0), p_at),
+      updated_at = p_at
+    where id = p_id;
+  elsif p_table = 'shared_memories' then
+    update public.shared_memories set
+      together_sec = greatest(0, together_sec + coalesce(p_together, 0)),
+      session_count = greatest(0, session_count + coalesce(p_sessions, 0)),
+      last_watched_at = greatest(coalesce(last_watched_at, 0), p_at),
+      updated_at = p_at
+    where id = p_id;
+  elsif p_table = 'scrapbook_entries' then
+    update public.scrapbook_entries set
+      watch_duration_sec = greatest(0, watch_duration_sec + coalesce(p_watch, 0)),
+      together_duration_sec = greatest(0, together_duration_sec + coalesce(p_together, 0)),
+      session_count = greatest(0, session_count + coalesce(p_sessions, 0)),
+      updated_at = p_at
+    where id = p_id;
+  else
+    raise exception 'sp_scrapbook_bump_totals: unsupported table %', p_table using errcode = '22023';
+  end if;
+  return found;
+end $$;
+
+-- Both partners' SHARED decisions and their co-sitting in ONE transaction:
+-- all rows are written or none is (a unique violation on either decision
+-- rolls the whole block back). Returns {"applied": true|false}.
+create or replace function public.sp_scrapbook_decide_pair(p_co jsonb, p_first jsonb, p_second jsonb)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+begin
+  if coalesce(p_first->>'destination', '') <> 'SHARED' or coalesce(p_second->>'destination', '') <> 'SHARED'
+     or p_first->>'co_sitting_id' is distinct from p_co->>'id' or p_second->>'co_sitting_id' is distinct from p_co->>'id'
+     or p_first->>'chapter_id' is distinct from p_co->>'chapter_id' or p_second->>'chapter_id' is distinct from p_co->>'chapter_id'
+     or p_first->>'sitting_id' = p_second->>'sitting_id' then
+    raise exception 'sp_scrapbook_decide_pair: inconsistent pair' using errcode = '22023';
+  end if;
+  begin
+    insert into public.co_sittings (id, chapter_id, source_key, opened_at, last_active_at, applied_together_sec, memory_id)
+    values (p_co->>'id', p_co->>'chapter_id', p_co->>'source_key', (p_co->>'opened_at')::bigint, (p_co->>'last_active_at')::bigint, 0, null)
+    on conflict (id) do nothing;
+    insert into public.sitting_decisions (sitting_id, user_id, source_key, destination, chapter_id, co_sitting_id, reason, decided_at, last_active_at)
+    select x->>'sitting_id', x->>'user_id', x->>'source_key', x->>'destination', x->>'chapter_id', x->>'co_sitting_id',
+           x->>'reason', (x->>'decided_at')::bigint, (x->>'last_active_at')::bigint
+    from (values (p_first), (p_second)) as v(x);
+    return jsonb_build_object('applied', true);
+  exception when unique_violation then
+    return jsonb_build_object('applied', false);
+  end;
+end $$;
+
+revoke all on public.scrapbook_locks from anon, authenticated;
+grant all on public.scrapbook_locks to service_role;
+revoke execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb) from public, anon, authenticated;
+grant execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) to service_role;
+grant execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb) to service_role;

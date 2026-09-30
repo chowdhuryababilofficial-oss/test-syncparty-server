@@ -2,6 +2,22 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
+
+// Scrapbook maintenance (purge of removed memories past their 30-day restore
+// window, removal-request expiry, ledger compaction): on boot, every 6 hours
+// and at most hourly from the Scrapbook list route. A DB lease keeps it to
+// one instance at a time. Timers are unref'd so they never hold the process.
+let lastScrapbookMaintenanceAt = 0;
+function maybeRunScrapbookMaintenance(force = false) {
+  if (!scrapbook.v2Enabled || !scrapbook.v2Enabled()) return;
+  if (!force && Date.now() - lastScrapbookMaintenanceAt < 3600000) return;
+  lastScrapbookMaintenanceAt = Date.now();
+  scrapbook.runMaintenance().catch(e => console.error('[SyncParty Scrapbook maintenance]', e?.message || e));
+}
+if (process.env.SP_DISABLE_SCRAPBOOK_MAINTENANCE !== "1") {
+  setTimeout(() => maybeRunScrapbookMaintenance(true), 30000).unref?.();
+  setInterval(() => maybeRunScrapbookMaintenance(true), 6 * 3600000).unref?.();
+}
 const metadataResolver = require("./metadata-resolver");
 const port = Number(process.env.PORT || 8787);
 
@@ -137,10 +153,20 @@ const httpServer = http.createServer(async (req, res) => {
       const limit=Math.min(300,Math.max(1,Number(u.searchParams.get("limit")||150)));
       // Archived memories stay viewable (read-only) when explicitly requested.
       const includeArchived=u.searchParams.get("includeArchived")!=="0";
+      maybeRunScrapbookMaintenance();
+      const relations=await scrapbook.listUserRelations(user.id);
+      if(scrapbook.v2Enabled()){
+        const flag=k=>u.searchParams.get(k)==="1";
+        if(scope==='shared'){
+          const r=await scrapbook.listSharedV2(user.id,{chapterId:u.searchParams.get("chapterId")||null,relationId,includeHidden:flag("includeHidden"),includeRemoved:flag("includeRemoved")});
+          json(res,200,{ok:true,scope,entries:r.entries.slice(0,limit),relations,chapter:r.chapter,chapters:r.chapters}); return;
+        }
+        const entries=await scrapbook.listPersonalV2(user.id,{limit,includeArchived,includeRemoved:flag("includeRemoved")});
+        json(res,200,{ok:true,scope,entries,relations}); return;
+      }
       const entries=scope==='shared'
         ? await scrapbook.listSharedEntries(user.id,relationId,limit,includeArchived)
         : await scrapbook.listPersonalEntries(user.id,limit,includeArchived);
-      const relations=await scrapbook.listUserRelations(user.id);
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
 
@@ -158,7 +184,9 @@ const httpServer = http.createServer(async (req, res) => {
         const ids=[relation.user1_id,relation.user2_id];
         if(!ids.includes(user.id)){json(res,403,{ok:false,error:"You are not part of this Shared Scrapbook."});return;}
       }
-      const targets=b.scope==='shared'?[relation.user1_id,relation.user2_id]:[user.id];
+      // v2: one shared memory per chapter - an old client's shared save only
+      // ever updates the CALLER's member totals (never a copy per partner).
+      const targets=b.scope==='shared'?(scrapbook.v2Enabled()?[user.id]:[relation.user1_id,relation.user2_id]):[user.id];
       const created=[];
       for(const uid of targets){created.push(await scrapbook.upsertEntry(uid,b.entry,b.scope==='shared'?relation.id:null));}
       json(res,200,{ok:true,entries:created}); return;
@@ -175,6 +203,12 @@ const httpServer = http.createServer(async (req, res) => {
       for(const e of entries){
         const key=e&&typeof e==='object'?String(e.sourceKey||''):'';
         try{
+          // Backed-up sitting saves keep their server-decided destination.
+          if(e&&e.sitting&&typeof e.sitting==='object'&&scrapbook.v2Enabled()){
+            const r=await scrapbook.saveSitting(user.id,{...e.sitting,entry:e});
+            if(r.ok){out.push({sourceKey:key,sitting:r});continue;}
+            failed.push({sourceKey:key,error:r.error||'Could not store entry.'});continue;
+          }
           const saved=await scrapbook.upsertEntry(user.id,e,null);
           if(saved) out.push(saved); else failed.push({sourceKey:key,error:'Malformed entry.'});
         }catch(err){
@@ -272,6 +306,44 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,{ok:true,...result}); return;
     }
 
+    if (path.startsWith("/api/scrapbook/sittings/") && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const kind=path.slice("/api/scrapbook/sittings/".length);
+      const r=kind==="intent"?await scrapbook.recordIntent(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null,playing:!!b.playing})
+        :kind==="decide"?await scrapbook.decideSitting(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null})
+        :kind==="save"?await scrapbook.saveSitting(user.id,b):{status:404,error:'Not found'};
+      if(r.error){json(res,r.status||400,{ok:false,error:r.error});return;}
+      json(res,200,{ok:true,...r}); return;
+    }
+
+    if (path === "/api/scrapbook/journeys/action" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const r=await scrapbook.journeyAction(user.id,b);
+      if(r.error){json(res,r.status||400,{ok:false,error:r.error,readOnly:!!r.readOnly,blockedUntil:r.blockedUntil||null});return;}
+      json(res,200,{ok:true,...r}); return;
+    }
+
+    // Lets the extension pick the v2 sitting save path only when the server
+    // has it enabled (SCRAPBOOK_SHARED_V2=1). Public, no user data.
+    if (path === "/api/scrapbook/capabilities" && req.method === "GET") {
+      json(res,200,{ok:true,sharedV2:scrapbook.v2Enabled()}); return;
+    }
+
+    if (path === "/api/scrapbook/chapters" && req.method === "GET") {
+      const user=await requireUser(req,res); if(!user)return;
+      json(res,200,{ok:true,chapters:await scrapbook.chaptersForUser(user.id)}); return;
+    }
+
+    if (path === "/api/scrapbook/moments" && req.method === "GET") {
+      const user=await requireUser(req,res); if(!user)return;
+      json(res,200,{ok:true,moments:await scrapbook.buildMoments(user.id)}); return;
+    }
+
+    if (path === "/api/scrapbook/moments/seen" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      json(res,200,await scrapbook.markMomentsSeen(user.id,b.momentIds)); return;
+    }
+
     if (path === "/api/scrapbook/highlights" && req.method === "GET") {
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,highlights:await scrapbook.getHighlights(user.id)});return;
@@ -280,6 +352,8 @@ const httpServer = http.createServer(async (req, res) => {
     json(res,404,{ok:false,error:'Not found'});
   } catch (e) {
     console.error('[SyncParty Scrapbook API]',e);
+    // A Scrapbook lock wait that timed out is retryable (503), not a crash.
+    if (e && e.code === 'SP_LOCK_TIMEOUT') { json(res,503,{ok:false,error:e.message,retryable:true}); return; }
     const message = process.env.NODE_ENV === 'production' ? 'SyncParty server error.' : (e?.message || 'SyncParty server error.');
     json(res,500,{ok:false,error:message});
   }
