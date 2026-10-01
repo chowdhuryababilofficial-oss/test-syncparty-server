@@ -32,6 +32,10 @@ const navigationTransitions = new Map();
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
+// Scrapbook v2 kill switch: v2-only routes answer this when SCRAPBOOK_SHARED_V2
+// is off, before any storage access (503 = retryable, so a client caught by an
+// ON -> OFF flip keeps its sitting envelope in its v2 backup, never in v1).
+function v2DisabledResponse(res) { const d=scrapbook.v2Disabled(); json(res,d.status,{ok:false,error:d.error,code:d.code,sharedV2:false}); }
 function json(res, status, body, extra={}) {
   res.writeHead(status, { "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"Content-Type, Authorization", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", ...extra });
   res.end(JSON.stringify(body));
@@ -204,7 +208,9 @@ const httpServer = http.createServer(async (req, res) => {
         const key=e&&typeof e==='object'?String(e.sourceKey||''):'';
         try{
           // Backed-up sitting saves keep their server-decided destination.
-          if(e&&e.sitting&&typeof e.sitting==='object'&&scrapbook.v2Enabled()){
+          if(e&&e.sitting&&typeof e.sitting==='object'){
+            // v2 OFF: refused, never re-routed into a v1 personal save.
+            if(!scrapbook.v2Enabled()){failed.push({sourceKey:key,error:scrapbook.v2Disabled().error,code:'SCRAPBOOK_V2_DISABLED'});continue;}
             const r=await scrapbook.saveSitting(user.id,{...e.sitting,entry:e});
             if(r.ok){out.push({sourceKey:key,sitting:r});continue;}
             failed.push({sourceKey:key,error:r.error||'Could not store entry.'});continue;
@@ -307,6 +313,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path.startsWith("/api/scrapbook/sittings/") && req.method === "POST") {
+      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const kind=path.slice("/api/scrapbook/sittings/".length);
       const r=kind==="intent"?await scrapbook.recordIntent(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null,playing:!!b.playing})
@@ -317,6 +324,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path === "/api/scrapbook/journeys/action" && req.method === "POST") {
+      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const r=await scrapbook.journeyAction(user.id,b);
       if(r.error){json(res,r.status||400,{ok:false,error:r.error,readOnly:!!r.readOnly,blockedUntil:r.blockedUntil||null});return;}
@@ -330,16 +338,19 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path === "/api/scrapbook/chapters" && req.method === "GET") {
+      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,chapters:await scrapbook.chaptersForUser(user.id)}); return;
     }
 
     if (path === "/api/scrapbook/moments" && req.method === "GET") {
+      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,moments:await scrapbook.buildMoments(user.id)}); return;
     }
 
     if (path === "/api/scrapbook/moments/seen" && req.method === "POST") {
+      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       json(res,200,await scrapbook.markMomentsSeen(user.id,b.momentIds)); return;
     }
@@ -352,8 +363,11 @@ const httpServer = http.createServer(async (req, res) => {
     json(res,404,{ok:false,error:'Not found'});
   } catch (e) {
     console.error('[SyncParty Scrapbook API]',e);
-    // A Scrapbook lock wait that timed out is retryable (503), not a crash.
-    if (e && e.code === 'SP_LOCK_TIMEOUT') { json(res,503,{ok:false,error:e.message,retryable:true}); return; }
+    // Scrapbook v2: a lock wait that timed out, a lock that moved to another
+    // server (fenced) or missing 9.7/9.8 functions are retryable 503s; a
+    // transition the database refused (SPV01/SPC01/SPR01) is a 409.
+    if (e && ['SP_LOCK_TIMEOUT','SP_FENCED','SP_SCHEMA_MISSING'].includes(e.code)) { json(res,503,{ok:false,error:e.message,retryable:true}); return; }
+    if (e && ['SPV01','SPC01','SPR01'].includes(e.code)) { json(res,409,{ok:false,error:'This Scrapbook change is no longer possible; refresh and try again.'}); return; }
     const message = process.env.NODE_ENV === 'production' ? 'SyncParty server error.' : (e?.message || 'SyncParty server error.');
     json(res,500,{ok:false,error:message});
   }

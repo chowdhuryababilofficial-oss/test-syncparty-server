@@ -560,25 +560,172 @@ begin
   return found;
 end $$;
 
--- Both partners' SHARED decisions and their co-sitting in ONE transaction:
--- all rows are written or none is (a unique violation on either decision
--- rolls the whole block back). Returns {"applied": true|false}.
-create or replace function public.sp_scrapbook_decide_pair(p_co jsonb, p_first jsonb, p_second jsonb)
-returns jsonb
+revoke all on public.scrapbook_locks from anon, authenticated;
+grant all on public.scrapbook_locks to service_role;
+revoke execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) from public, anon, authenticated;
+grant execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 9.8 Database-authoritative Scrapbook v2 transitions (fencing tokens)
+-- ---------------------------------------------------------------------------
+-- The database is the final authority for every critical v2 transition. Each
+-- function below runs as ONE transaction and re-validates its own
+-- preconditions under row locks, so two server instances (or a paused worker
+-- that resumes late) can never produce duplicate shared sittings,
+-- conflicting decisions, double-applied saves or purge/restore races -
+-- regardless of what the Node process believed when it called.
+--
+-- Fencing: acquiring a scrapbook_locks row returns a strictly increasing
+-- fence number. Callers pass the fences they hold as
+-- p_fences = [{"k": <lock key>, "f": <fence>}, ...]; each function first
+-- locks those rows FOR UPDATE and raises SQLSTATE 'SPF01' (SP_FENCED) when
+-- any of them is no longer held with that fence, i.e. when the lease expired
+-- and another worker took it over. Because the lock row stays row-locked
+-- until commit, a new owner cannot take the lease while a fenced commit is
+-- in flight. p_fences = null skips the check (DB locks disabled); the
+-- atomic validations below still apply.
+--
+-- Error codes: SPF01 fenced (stale lock owner), SPV01 invalid transition
+-- (e.g. not the chapter's Story partner pair), SPC01 chapter closed /
+-- Story not active, SPR01 removed or purged journey generation.
+-- Everything is additive and idempotent to (re)apply. service_role only.
+
+alter table public.scrapbook_locks add column if not exists fence bigint not null default 0;
+create sequence if not exists public.scrapbook_lock_fence_seq;
+revoke all on sequence public.scrapbook_lock_fence_seq from public, anon, authenticated;
+drop function if exists public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb);
+
+create or replace function public.sp_now_ms() returns bigint
+language sql volatile set search_path = public as $$
+  select (extract(epoch from clock_timestamp()) * 1000)::bigint
+$$;
+
+-- Acquire or take over an EXPIRED lease in one statement; returns the new
+-- fence, or null when another holder's lease is still live.
+create or replace function public.sp_scrapbook_lock_acquire(p_key text, p_holder text, p_ttl_ms bigint)
+returns bigint
+language plpgsql security definer set search_path = public as $$
+declare v bigint; t bigint := public.sp_now_ms();
+begin
+  insert into public.scrapbook_locks as l (key, holder, until_at, fence)
+  values (p_key, p_holder, t + greatest(p_ttl_ms, 1), nextval('public.scrapbook_lock_fence_seq'))
+  on conflict (key) do update set holder = excluded.holder, until_at = excluded.until_at, fence = excluded.fence
+  where l.until_at < t
+  returning l.fence into v;
+  return v;
+end $$;
+
+create or replace function public.sp_scrapbook_lock_renew(p_key text, p_holder text, p_fence bigint, p_ttl_ms bigint)
+returns boolean
 language plpgsql security definer set search_path = public as $$
 begin
+  update public.scrapbook_locks set until_at = public.sp_now_ms() + greatest(p_ttl_ms, 1)
+  where key = p_key and holder = p_holder and fence = p_fence;
+  return found;
+end $$;
+
+create or replace function public.sp_scrapbook_lock_release(p_key text, p_holder text, p_fence bigint)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  delete from public.scrapbook_locks where key = p_key and holder = p_holder and fence = p_fence;
+  return found;
+end $$;
+
+create or replace function public.sp_scrapbook_check_fences(p_fences jsonb) returns void
+language plpgsql security definer set search_path = public as $$
+declare f jsonb;
+begin
+  if p_fences is null or jsonb_typeof(p_fences) <> 'array' then return; end if;
+  for f in select value from jsonb_array_elements(p_fences) loop
+    perform 1 from public.scrapbook_locks where key = f->>'k' and fence = (f->>'f')::bigint for update;
+    if not found then
+      raise exception 'SP_FENCED: lock % is no longer held with fence %', f->>'k', f->>'f' using errcode = 'SPF01';
+    end if;
+  end loop;
+end $$;
+
+-- The two users of a chapter's Story. With p_require_open the chapter must be
+-- open and its relation active. Row-locks both rows FOR SHARE, so a Story
+-- cannot end / a chapter cannot close while the caller's transaction runs.
+create or replace function public.sp_scrapbook_story_users(p_chapter_id text, p_require_open boolean)
+returns text[]
+language plpgsql security definer set search_path = public as $$
+declare c public.story_chapters%rowtype; r public.relations%rowtype;
+begin
+  select * into c from public.story_chapters where id = p_chapter_id for share;
+  if not found then raise exception 'SP_INVALID: chapter % not found', p_chapter_id using errcode = 'SPV01'; end if;
+  select * into r from public.relations where id = c.relation_id for share;
+  if not found then raise exception 'SP_INVALID: relation of chapter % not found', p_chapter_id using errcode = 'SPV01'; end if;
+  if p_require_open and (c.ended_at is not null or r.accepted_at is null or r.archived_at is not null or r.ended_at is not null) then
+    raise exception 'SP_CHAPTER_CLOSED: chapter % is not an active Story chapter', p_chapter_id using errcode = 'SPC01';
+  end if;
+  return array[r.user1_id, r.user2_id];
+end $$;
+
+-- Write-once sitting decision. SHARED is only accepted for a member of the
+-- chapter's active Story, inside a co-sitting of that chapter and episode.
+-- Returns the stored decision (the first one written wins forever).
+create or replace function public.sp_scrapbook_write_decision(p_row jsonb, p_fences jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare t bigint := coalesce((p_row->>'decided_at')::bigint, public.sp_now_ms()); out jsonb;
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  if coalesce(p_row->>'destination', '') not in ('PERSONAL', 'SHARED') or coalesce(p_row->>'sitting_id', '') = '' or coalesce(p_row->>'user_id', '') = '' then
+    raise exception 'SP_INVALID: malformed decision' using errcode = 'SPV01';
+  end if;
+  perform 1 from public.sitting_intents where sitting_id = p_row->>'sitting_id' and user_id <> p_row->>'user_id';
+  if found then raise exception 'SP_INVALID: sitting % belongs to another user', p_row->>'sitting_id' using errcode = 'SPV01'; end if;
+  if p_row->>'destination' = 'SHARED' then
+    if not ((p_row->>'user_id') = any(public.sp_scrapbook_story_users(p_row->>'chapter_id', true))) then
+      raise exception 'SP_NOT_STORY_PARTNER: user is not part of chapter %', p_row->>'chapter_id' using errcode = 'SPV01';
+    end if;
+    perform 1 from public.co_sittings where id = p_row->>'co_sitting_id' and chapter_id = p_row->>'chapter_id' and source_key = p_row->>'source_key';
+    if not found then raise exception 'SP_INVALID: co-sitting % does not belong to this chapter/episode', p_row->>'co_sitting_id' using errcode = 'SPV01'; end if;
+  end if;
+  insert into public.sitting_decisions (sitting_id, user_id, source_key, destination, chapter_id, co_sitting_id, reason, decided_at, last_active_at)
+  values (p_row->>'sitting_id', p_row->>'user_id', p_row->>'source_key', p_row->>'destination',
+          case when p_row->>'destination' = 'SHARED' then p_row->>'chapter_id' end,
+          case when p_row->>'destination' = 'SHARED' then p_row->>'co_sitting_id' end,
+          p_row->>'reason', t, coalesce((p_row->>'last_active_at')::bigint, t))
+  on conflict (sitting_id) do nothing;
+  select to_jsonb(d) into out from public.sitting_decisions d where d.sitting_id = p_row->>'sitting_id';
+  return out;
+end $$;
+
+-- Both partners' SHARED decisions and their co-sitting in ONE transaction.
+-- The two users must be exactly the two users of the chapter's ACTIVE Story
+-- (never a third viewer of the same room), each sitting must be a recorded
+-- intent of that user for that episode, and the chapter must be open.
+-- A unique violation on either decision rolls the block back -> applied false.
+create or replace function public.sp_scrapbook_decide_pair(p_co jsonb, p_first jsonb, p_second jsonb, p_fences jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare users text[]; v_x jsonb;
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
   if coalesce(p_first->>'destination', '') <> 'SHARED' or coalesce(p_second->>'destination', '') <> 'SHARED'
      or p_first->>'co_sitting_id' is distinct from p_co->>'id' or p_second->>'co_sitting_id' is distinct from p_co->>'id'
      or p_first->>'chapter_id' is distinct from p_co->>'chapter_id' or p_second->>'chapter_id' is distinct from p_co->>'chapter_id'
+     or p_first->>'source_key' is distinct from p_co->>'source_key' or p_second->>'source_key' is distinct from p_co->>'source_key'
      or p_first->>'sitting_id' = p_second->>'sitting_id' then
-    raise exception 'sp_scrapbook_decide_pair: inconsistent pair' using errcode = '22023';
+    raise exception 'SP_INVALID: inconsistent pair' using errcode = 'SPV01';
   end if;
+  users := public.sp_scrapbook_story_users(p_co->>'chapter_id', true);
+  if p_first->>'user_id' = p_second->>'user_id' or not ((p_first->>'user_id') = any(users)) or not ((p_second->>'user_id') = any(users)) then
+    raise exception 'SP_NOT_STORY_PAIR: the two sittings are not the Story partner pair of chapter %', p_co->>'chapter_id' using errcode = 'SPV01';
+  end if;
+  foreach v_x in array array[p_first, p_second] loop
+    perform 1 from public.sitting_intents where sitting_id = v_x->>'sitting_id' and user_id = v_x->>'user_id' and source_key = v_x->>'source_key';
+    if not found then raise exception 'SP_INVALID: sitting % is not a recorded intent of its user', v_x->>'sitting_id' using errcode = 'SPV01'; end if;
+  end loop;
   begin
     insert into public.co_sittings (id, chapter_id, source_key, opened_at, last_active_at, applied_together_sec, memory_id)
     values (p_co->>'id', p_co->>'chapter_id', p_co->>'source_key', (p_co->>'opened_at')::bigint, (p_co->>'last_active_at')::bigint, 0, null)
     on conflict (id) do nothing;
     insert into public.sitting_decisions (sitting_id, user_id, source_key, destination, chapter_id, co_sitting_id, reason, decided_at, last_active_at)
-    select x->>'sitting_id', x->>'user_id', x->>'source_key', x->>'destination', x->>'chapter_id', x->>'co_sitting_id',
+    select x->>'sitting_id', x->>'user_id', x->>'source_key', 'SHARED', x->>'chapter_id', x->>'co_sitting_id',
            x->>'reason', (x->>'decided_at')::bigint, (x->>'last_active_at')::bigint
     from (values (p_first), (p_second)) as v(x);
     return jsonb_build_object('applied', true);
@@ -587,9 +734,279 @@ begin
   end;
 end $$;
 
-revoke all on public.scrapbook_locks from anon, authenticated;
-grant all on public.scrapbook_locks to service_role;
-revoke execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) from public, anon, authenticated;
-revoke execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb) from public, anon, authenticated;
-grant execute on function public.sp_scrapbook_bump_totals(text, text, bigint, bigint, integer, bigint) to service_role;
-grant execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb) to service_role;
+-- Idempotent sitting save: (sitting, seq) with running totals. The decision,
+-- owner, destination and target are verified from stored rows (never from
+-- the caller), the closed-chapter grace window and journey removal are
+-- enforced here, and the ledger row moves monotonically under FOR UPDATE.
+-- p_row: sitting_id, user_id, target_id, watch_cum, together_cum,
+--        journey_key + generation (My Scrapbook targets), max_age_ms.
+-- Returns {"status": inserted|advanced|duplicate|chapter_closed|chapter_missing|removed|expired, "ledger": {...}}.
+create or replace function public.sp_scrapbook_save_ledger(p_row jsonb, p_seq integer, p_now bigint, p_grace_ms bigint, p_fences jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  d public.sitting_decisions%rowtype;
+  ch public.story_chapters%rowtype;
+  l public.sitting_ledger%rowtype;
+  has_l boolean;
+  v_now bigint := greatest(coalesce(p_now, 0), public.sp_now_ms());
+  v_target text := p_row->>'target_id';
+  v_space text; v_jk text; v_gen integer; v_removed boolean;
+  w bigint; tg bigint; v_status text;
+  in_w bigint := greatest(0, coalesce((p_row->>'watch_cum')::bigint, 0));
+  in_t bigint := greatest(0, coalesce((p_row->>'together_cum')::bigint, 0));
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  select * into d from public.sitting_decisions where sitting_id = p_row->>'sitting_id';
+  if not found or d.user_id <> p_row->>'user_id' then
+    raise exception 'SP_INVALID: sitting % has no decision for this user', p_row->>'sitting_id' using errcode = 'SPV01';
+  end if;
+  if d.destination = 'SHARED' then
+    select * into ch from public.story_chapters where id = d.chapter_id for share;
+    if not found then return jsonb_build_object('status', 'chapter_missing'); end if;
+    if ch.ended_at is not null and (d.decided_at > ch.ended_at or v_now > ch.ended_at + p_grace_ms) then
+      return jsonb_build_object('status', 'chapter_closed');
+    end if;
+    select m.journey_key, m.journey_version into v_jk, v_gen from public.shared_memories m
+      where m.id = v_target and m.chapter_id = d.chapter_id and m.source_key = d.source_key;
+    if not found then raise exception 'SP_INVALID: target is not this sitting''s shared memory' using errcode = 'SPV01'; end if;
+    v_space := 'c:' || d.chapter_id;
+  else
+    perform 1 from public.scrapbook_entries e where e.id = v_target and e.user_id = d.user_id and e.source_key = d.source_key;
+    if not found then raise exception 'SP_INVALID: target is not this sitting''s scrapbook row' using errcode = 'SPV01'; end if;
+    v_jk := p_row->>'journey_key';
+    v_gen := coalesce((p_row->>'generation')::integer, 1);
+    v_space := 'u:' || d.user_id;
+  end if;
+  select * into l from public.sitting_ledger where sitting_id = d.sitting_id for update;
+  has_l := found;
+  if has_l and p_seq <= l.last_seq then return jsonb_build_object('status', 'duplicate', 'ledger', to_jsonb(l)); end if;
+  if has_l and l.target_id <> v_target then raise exception 'SP_INVALID: ledger target mismatch' using errcode = 'SPV01'; end if;
+  -- FOR SHARE: a concurrent remove / restore of this generation serialises with this save.
+  perform 1 from public.journey_state s where s.space = v_space and s.journey_key = v_jk and s.generation = v_gen for share;
+  select exists (select 1 from public.journey_state s where s.space = v_space and s.journey_key = v_jk and s.removed_at is not null
+                 and (s.generation = v_gen or s.removed_at >= d.decided_at)) into v_removed;
+  if v_removed then return jsonb_build_object('status', 'removed'); end if;
+  if not has_l then
+    if p_row ? 'max_age_ms' and d.decided_at < v_now - (p_row->>'max_age_ms')::bigint then
+      return jsonb_build_object('status', 'expired');
+    end if;
+    w := in_w; tg := least(in_t, w);
+    insert into public.sitting_ledger (sitting_id, user_id, destination, target_id, co_sitting_id, last_seq, watch_sec_cum, together_sec_cum,
+                                       interval_start, interval_end, applied_watch_sec, applied_together_sec, applied_sessions, updated_at)
+    values (d.sitting_id, d.user_id, d.destination, v_target, d.co_sitting_id, p_seq, w, tg, p_now - w * 1000, p_now, 0, 0, 0, p_now)
+    on conflict (sitting_id) do nothing
+    returning * into l;
+    if found then
+      v_status := 'inserted';
+    else
+      select * into l from public.sitting_ledger where sitting_id = d.sitting_id for update;
+      if p_seq <= l.last_seq then return jsonb_build_object('status', 'duplicate', 'ledger', to_jsonb(l)); end if;
+    end if;
+  end if;
+  if v_status is null then
+    w := greatest(l.watch_sec_cum, in_w);
+    tg := greatest(l.together_sec_cum, least(in_t, w));
+    update public.sitting_ledger set last_seq = p_seq, watch_sec_cum = w, together_sec_cum = tg,
+      interval_start = least(l.interval_start, p_now - w * 1000), interval_end = greatest(l.interval_end, p_now), updated_at = p_now
+    where sitting_id = d.sitting_id
+    returning * into l;
+    v_status := 'advanced';
+  end if;
+  update public.sitting_decisions set last_active_at = greatest(last_active_at, p_now) where sitting_id = d.sitting_id;
+  return jsonb_build_object('status', v_status, 'ledger', to_jsonb(l));
+end $$;
+
+-- Credited amounts of one ledger row move by compare-and-set AND the totals
+-- change by exactly that delta in the same transaction.
+create or replace function public.sp_scrapbook_apply_ledger(p_sitting_id text, p_old jsonb, p_new jsonb, p_table text, p_bump_id text, p_at bigint, p_fences jsonb default null)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+declare l public.sitting_ledger%rowtype;
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  update public.sitting_ledger set applied_watch_sec = (p_new->>'w')::bigint, applied_together_sec = (p_new->>'t')::bigint, applied_sessions = (p_new->>'s')::integer
+  where sitting_id = p_sitting_id and applied_watch_sec = (p_old->>'w')::bigint and applied_together_sec = (p_old->>'t')::bigint and applied_sessions = (p_old->>'s')::integer
+  returning * into l;
+  if not found then return false; end if;
+  if p_table = 'shared_memory_members' then
+    perform 1 from public.shared_memory_members where id = p_bump_id and memory_id = l.target_id and user_id = l.user_id;
+  elsif p_table = 'scrapbook_entries' then
+    perform 1 from public.scrapbook_entries where id = p_bump_id and id = l.target_id and user_id = l.user_id;
+  else
+    raise exception 'SP_INVALID: unsupported table %', p_table using errcode = 'SPV01';
+  end if;
+  if not found then raise exception 'SP_INVALID: totals row does not belong to this ledger row' using errcode = 'SPV01'; end if;
+  perform public.sp_scrapbook_bump_totals(p_table, p_bump_id, (p_new->>'w')::bigint - (p_old->>'w')::bigint,
+    (p_new->>'t')::bigint - (p_old->>'t')::bigint, (p_new->>'s')::integer - (p_old->>'s')::integer, p_at);
+  return true;
+end $$;
+
+-- together(co) moves by compare-and-set and the memory follows in the same transaction.
+create or replace function public.sp_scrapbook_apply_co(p_co_id text, p_old bigint, p_new bigint, p_memory_id text, p_at bigint, p_fences jsonb default null)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  update public.co_sittings set applied_together_sec = p_new, last_active_at = greatest(last_active_at, p_at)
+  where id = p_co_id and applied_together_sec = p_old and memory_id = p_memory_id;
+  if not found then return false; end if;
+  perform public.sp_scrapbook_bump_totals('shared_memories', p_memory_id, 0, p_new - p_old, 0, p_at);
+  return true;
+end $$;
+
+-- Links a co-sitting to its memory exactly once and counts its ONE session.
+create or replace function public.sp_scrapbook_link_co(p_co_id text, p_memory_id text, p_at bigint, p_fences jsonb default null)
+returns boolean
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  update public.co_sittings c set memory_id = p_memory_id, last_active_at = greatest(c.last_active_at, p_at)
+  where c.id = p_co_id and c.memory_id is null
+    and exists (select 1 from public.shared_memories m where m.id = p_memory_id and m.chapter_id = c.chapter_id and m.source_key = c.source_key);
+  if not found then return false; end if;
+  perform public.sp_scrapbook_bump_totals('shared_memories', p_memory_id, 0, 0, 1, p_at);
+  return true;
+end $$;
+
+-- Conditional journey_state update: applied only when every column in
+-- p_expect still holds the expected value (row locked FOR UPDATE), otherwise
+-- returns null (the caller reports a conflict). purged_at and the row
+-- identity can never be changed here. p_require_open: the chapter of a
+-- 'c:' space must still be open (closed chapters are read-only).
+create or replace function public.sp_scrapbook_journey_update(p_state_id text, p_expect jsonb, p_patch jsonb, p_require_open boolean default false, p_fences jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare s public.journey_state%rowtype; n public.journey_state%rowtype; cur jsonb; k text; v_ended bigint;
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  select * into s from public.journey_state where id = p_state_id for update;
+  if not found then return null; end if;
+  if p_require_open and s.space like 'c:%' then
+    select ended_at into v_ended from public.story_chapters where id = substr(s.space, 3) for share;
+    if not found or v_ended is not null then
+      raise exception 'SP_CHAPTER_CLOSED: chapter % is read-only', substr(s.space, 3) using errcode = 'SPC01';
+    end if;
+  end if;
+  cur := to_jsonb(s);
+  for k in select jsonb_object_keys(coalesce(p_expect, '{}'::jsonb)) loop
+    if (cur->k) is distinct from (p_expect->k) then return null; end if;
+  end loop;
+  n := jsonb_populate_record(s, coalesce(p_patch, '{}'::jsonb) - 'id' - 'space' - 'journey_key' - 'generation' - 'purged_at');
+  update public.journey_state set
+    display_title = n.display_title, title_edited_by = n.title_edited_by, title_edited_at = n.title_edited_at,
+    archived_at = n.archived_at, removed_at = n.removed_at, removed_by = n.removed_by, purge_after = n.purge_after,
+    removal_state = n.removal_state, removal_requested_by = n.removal_requested_by, removal_requested_at = n.removal_requested_at,
+    removal_blocked_until = n.removal_blocked_until, updated_at = n.updated_at
+  where id = p_state_id
+  returning * into n;
+  return to_jsonb(n);
+end $$;
+
+-- Purges ONE removed generation past its restore window, atomically: re-check
+-- under FOR UPDATE, delete its rows, mark purged, write the tombstone. A
+-- concurrent restore (journey_update on the same row) either commits first
+-- (then this finds removed_at null and does nothing) or waits and then fails
+-- its expectation. p_entry_ids: My Scrapbook row ids of that generation.
+create or replace function public.sp_scrapbook_purge_journey(p_state_id text, p_now bigint, p_entry_ids jsonb default '[]'::jsonb, p_fences jsonb default null)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare s public.journey_state%rowtype; v_keys jsonb := '[]'::jsonb; v_rows integer := 0; v_ids text[];
+begin
+  perform public.sp_scrapbook_check_fences(p_fences);
+  select * into s from public.journey_state where id = p_state_id for update;
+  if not found or s.removed_at is null or s.purged_at is not null or coalesce(s.purge_after, 0) > p_now then
+    return jsonb_build_object('purged', false);
+  end if;
+  if s.space like 'c:%' then
+    select coalesce(array_agg(id), '{}'), coalesce(jsonb_agg(source_key), '[]'::jsonb), count(*) into v_ids, v_keys, v_rows
+    from public.shared_memories where chapter_id = substr(s.space, 3) and journey_key = s.journey_key and journey_version = s.generation;
+    delete from public.shared_memory_members where memory_id = any(v_ids);
+    delete from public.sitting_ledger where target_id = any(v_ids);
+    delete from public.shared_memories where id = any(v_ids);
+  else
+    select coalesce(array_agg(id), '{}'), coalesce(jsonb_agg(source_key), '[]'::jsonb), count(*) into v_ids, v_keys, v_rows
+    from public.scrapbook_entries
+    where id in (select jsonb_array_elements_text(coalesce(p_entry_ids, '[]'::jsonb)))
+      and user_id = substr(s.space, 3)
+      and scope = case when s.generation > 1 then 'personal:v' || s.generation else 'personal' end;
+    delete from public.sitting_ledger where target_id = any(v_ids);
+    delete from public.scrapbook_entries where id = any(v_ids);
+  end if;
+  update public.journey_state set purged_at = p_now, updated_at = p_now where id = p_state_id;
+  insert into public.memory_tombstones (id, space, journey_key, generation, source_keys, purged_at)
+  values ('tomb_' || s.id, s.space, s.journey_key, s.generation, v_keys, p_now)
+  on conflict (id) do nothing;
+  return jsonb_build_object('purged', true, 'rows', v_rows, 'keys', v_keys);
+end $$;
+
+-- No resurrection at the database level: nothing can be inserted into a
+-- removed generation, a purged generation can never be un-purged/restored,
+-- and a removed generation cannot be restored once a newer one exists.
+create or replace function public.sp_scrapbook_no_resurrect() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare v_chapter text; v_jk text; v_gen integer;
+begin
+  if tg_table_name = 'shared_memories' then
+    v_chapter := new.chapter_id; v_jk := new.journey_key; v_gen := new.journey_version;
+  else
+    select chapter_id, journey_key, journey_version into v_chapter, v_jk, v_gen from public.shared_memories where id = new.memory_id;
+  end if;
+  if exists (select 1 from public.journey_state s where s.space = 'c:' || v_chapter and s.journey_key = v_jk and s.generation = v_gen and s.removed_at is not null) then
+    raise exception 'SP_REMOVED: journey % v% of chapter % was removed', v_jk, v_gen, v_chapter using errcode = 'SPR01';
+  end if;
+  return new;
+end $$;
+drop trigger if exists shared_memories_no_resurrect_trg on public.shared_memories;
+create trigger shared_memories_no_resurrect_trg before insert on public.shared_memories
+  for each row execute function public.sp_scrapbook_no_resurrect();
+drop trigger if exists shared_memory_members_no_resurrect_trg on public.shared_memory_members;
+create trigger shared_memory_members_no_resurrect_trg before insert on public.shared_memory_members
+  for each row execute function public.sp_scrapbook_no_resurrect();
+
+create or replace function public.journey_state_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.space is distinct from old.space or new.journey_key is distinct from old.journey_key or new.generation is distinct from old.generation then
+    raise exception 'SP_INVALID: journey state identity is immutable' using errcode = 'SPV01';
+  end if;
+  if old.purged_at is not null and (new.purged_at is null or new.removed_at is null) then
+    raise exception 'SP_PURGED: purged journey generation % cannot be restored', old.id using errcode = 'SPR01';
+  end if;
+  if old.removed_at is not null and new.removed_at is null and exists (
+    select 1 from public.journey_state s where s.space = old.space and s.journey_key = old.journey_key and s.generation > old.generation) then
+    raise exception 'SP_REMOVED: a newer generation exists; % cannot be restored', old.id using errcode = 'SPR01';
+  end if;
+  return new;
+end $$;
+drop trigger if exists journey_state_guard_trg on public.journey_state;
+create trigger journey_state_guard_trg before update on public.journey_state
+  for each row execute function public.journey_state_guard();
+
+revoke execute on function public.sp_now_ms() from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_lock_acquire(text, text, bigint) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_lock_renew(text, text, bigint, bigint) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_lock_release(text, text, bigint) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_check_fences(jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_story_users(text, boolean) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_write_decision(jsonb, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_save_ledger(jsonb, integer, bigint, bigint, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_apply_ledger(text, jsonb, jsonb, text, text, bigint, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_apply_co(text, bigint, bigint, text, bigint, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_link_co(text, text, bigint, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_journey_update(text, jsonb, jsonb, boolean, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_purge_journey(text, bigint, jsonb, jsonb) from public, anon, authenticated;
+revoke execute on function public.sp_scrapbook_no_resurrect() from public, anon, authenticated;
+revoke execute on function public.journey_state_guard() from public, anon, authenticated;
+grant execute on function public.sp_scrapbook_lock_acquire(text, text, bigint) to service_role;
+grant execute on function public.sp_scrapbook_lock_renew(text, text, bigint, bigint) to service_role;
+grant execute on function public.sp_scrapbook_lock_release(text, text, bigint) to service_role;
+grant execute on function public.sp_scrapbook_write_decision(jsonb, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_decide_pair(jsonb, jsonb, jsonb, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_save_ledger(jsonb, integer, bigint, bigint, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_apply_ledger(text, jsonb, jsonb, text, text, bigint, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_apply_co(text, bigint, bigint, text, bigint, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_link_co(text, text, bigint, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_journey_update(text, jsonb, jsonb, boolean, jsonb) to service_role;
+grant execute on function public.sp_scrapbook_purge_journey(text, bigint, jsonb, jsonb) to service_role;

@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { AsyncLocalStorage } = require("async_hooks");
 const { getSupabaseAdmin } = require("./supabase");
 const { publicUser } = require("./auth-store");
 
@@ -558,13 +559,20 @@ async function removeEntries(userId, entryIds) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("scrapbook_entries").select("*").eq("user_id", userId).in("id", ids);
   if (error) throw error;
+  if (!v2Enabled()) {
+    // v1 (v2 OFF): the caller's own personal rows are removed from the v1
+    // table the v1 list reads. Never touches v2 journey state.
+    const own = (data || []).filter(r => r.scope === "personal").map(r => r.id);
+    if (own.length) { const { error: de } = await sb.from("scrapbook_entries").delete().eq("user_id", userId).eq("scope", "personal").in("id", own); if (de) throw de; }
+    return { removed: own.length, soft: false };
+  }
   const keys = [...new Set((data || []).filter(r => scopeGeneration(r.scope) != null).map(r => journeyKeyOf(rowToEntry(r))))];
   for (const journeyKey of keys) await journeyAction(userId, { space: "personal", journeyKey, action: "remove" });
   return { removed: (data || []).length, soft: true };
 }
 
 async function getHighlights(userId) {
-  const entries = await listPersonalV2(userId, { includeArchived: true });
+  const entries = v2Enabled() ? await listPersonalV2(userId, { includeArchived: true }) : await listPersonalEntries(userId, 300, true);
   const totalSec = entries.reduce((n, e) => n + (e.watchDurationSec || 0), 0);
   return {
     totalEntries: entries.length,
@@ -596,44 +604,88 @@ const V2 = {
 // OFF until the v2 client (sitting saves) ships: the current extension still
 // sends v1 dual personal+shared saves. Set SCRAPBOOK_SHARED_V2=1 to enable.
 function v2Enabled() { return String(process.env.SCRAPBOOK_SHARED_V2 ?? "0") === "1"; }
+// Hard server-side kill switch. With v2 OFF no v2-only entry point reads or
+// writes v2 storage, so a client still mid-sitting after an ON -> OFF flip is
+// refused (503, retryable: the client keeps its envelope in its separate v2
+// backup) and is never re-routed into the v1 tables.
+const V2_DISABLED_ERROR = "Shared Scrapbook v2 is disabled on this server.";
+function v2Disabled() { return { status: 503, code: "SCRAPBOOK_V2_DISABLED", error: V2_DISABLED_ERROR, v2Disabled: true }; }
 
 const v2Locks = new Map();
-// Cross-instance mutual exclusion. The in-process queue orders work inside
-// one Node process; when v2 is on, the same key is ALSO held as a row in
-// public.scrapbook_locks so a second server instance waits instead of racing.
-// Acquire = INSERT (primary key) or steal an EXPIRED row with a conditional
-// UPDATE - both single atomic statements. The lease is renewed while the work
-// runs and released by holder. Correctness does not rest on the lease alone:
-// decisions are write-once, pair decisions are atomic (RPC), ledger seq moves
-// by compare-and-set and totals are applied as atomic increments.
-const LOCK_TTL_MS = 15000;
-const LOCK_WAIT_MS = 10000;
+// Cross-instance mutual exclusion WITH FENCING. The in-process queue orders
+// work inside one Node process; when v2 is on, the same key is ALSO held as a
+// row in public.scrapbook_locks (sp_scrapbook_lock_acquire: insert, or take
+// over an EXPIRED lease, in one statement) and every acquisition returns a
+// strictly increasing fence number. The fences held by the current async
+// call chain travel with every critical write (p_fences): the database
+// rejects the write with SP_FENCED if the lease expired and moved to another
+// worker meanwhile, so a paused/slow worker can never commit a stale
+// decision, save, journey change or purge. The lease is renewed while the
+// work runs and released by holder+fence. Correctness does not rest on the
+// lease alone: every transition is an atomic, self-validating DB function
+// (supabase-schema.sql 9.8).
+const LOCK_TTL_MS = Math.max(50, Number(process.env.SCRAPBOOK_LOCK_TTL_MS) || 15000);
+const LOCK_WAIT_MS = Math.max(50, Number(process.env.SCRAPBOOK_LOCK_WAIT_MS) || 10000);
+// Test-only hooks (never set in production): beforeRpc(name, params) runs
+// before each fenced write; renew=false stops lease renewal (simulates a
+// stalled worker whose lease expires).
+const testHooks = { beforeRpc: null, renew: true };
+const leaseCtx = new AsyncLocalStorage();
+function heldFences() {
+  const held = leaseCtx.getStore();
+  return held && held.length ? held.map(l => ({ k: l.key, f: l.fence })) : null;
+}
 function dbLocksEnabled() { return v2Enabled() && String(process.env.SCRAPBOOK_DB_LOCKS ?? "1") !== "0"; }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+function rpcMissing(error) { return !!error && ["PGRST202", "42883", "PGRST204"].includes(String(error.code || "")); }
+function schemaError(name) {
+  const e = new Error(`Scrapbook v2 needs ${name}() - apply supabase-schema.sql sections 9.7-9.8.`);
+  e.status = 503; e.code = "SP_SCHEMA_MISSING"; return e;
+}
+// Calls a 9.7/9.8 function. Scrapbook v2 fails CLOSED without them: there is
+// no unguarded read-modify-write fallback any more.
+async function rpcRequired(name, params) {
+  const sb = sbx();
+  if (typeof sb.rpc !== "function") throw schemaError(name);
+  const { data, error } = await sb.rpc(name, params);
+  if (!error) return data;
+  if (rpcMissing(error)) { console.warn(`[SyncParty Scrapbook] ${name}() missing - apply supabase-schema.sql 9.7-9.8.`); throw schemaError(name); }
+  const msg = String(error.message || "");
+  if (error.code === "SPF01" || msg.includes("SP_FENCED")) {
+    const e = new Error("Scrapbook lock moved to another server; try again."); e.status = 503; e.code = "SP_FENCED"; throw e;
+  }
+  const e = new Error(msg || "Scrapbook database error");
+  e.code = error.code; e.dbError = error;
+  if (["SPV01", "SPC01", "SPR01"].includes(String(error.code))) e.status = 409;
+  throw e;
+}
+// A critical write: carries the fences of every lock this call chain holds.
+async function fencedRpc(name, params) {
+  if (testHooks.beforeRpc) await testHooks.beforeRpc(name, params);
+  return rpcRequired(name, { ...params, p_fences: heldFences() });
+}
 async function acquireDbLock(key) {
   const holder = id("lk");
   const deadline = Date.now() + LOCK_WAIT_MS;
+  let fence = null;
   for (let attempt = 0; ; attempt++) {
-    const t = now();
-    const { error } = await sbx().from("scrapbook_locks").insert({ key, holder, until_at: t + LOCK_TTL_MS });
-    if (!error) break;
-    if (error.code !== "23505") throw error;
-    const { data, error: stealError } = await sbx().from("scrapbook_locks").update({ holder, until_at: t + LOCK_TTL_MS }).eq("key", key).lt("until_at", t).select("*");
-    if (stealError) throw stealError;
-    if ((Array.isArray(data) ? data : data ? [data] : []).some(r => r.holder === holder)) break;
+    fence = await rpcRequired("sp_scrapbook_lock_acquire", { p_key: key, p_holder: holder, p_ttl_ms: LOCK_TTL_MS });
+    if (fence != null) break;
     if (Date.now() > deadline) { const e = new Error("Scrapbook is busy, try again."); e.status = 503; e.code = "SP_LOCK_TIMEOUT"; throw e; }
     await sleep(Math.min(100, 4 + attempt * 6) + Math.floor(Math.random() * 8));
   }
-  const lease = { key, holder, timer: null };
+  const lease = { key, holder, fence: Number(fence), timer: null, lost: false };
   lease.timer = setInterval(() => {
-    sbx().from("scrapbook_locks").update({ until_at: now() + LOCK_TTL_MS }).eq("key", key).eq("holder", holder).then(() => {}, () => {});
-  }, Math.floor(LOCK_TTL_MS / 3));
+    if (!testHooks.renew) return;
+    rpcRequired("sp_scrapbook_lock_renew", { p_key: key, p_holder: holder, p_fence: lease.fence, p_ttl_ms: LOCK_TTL_MS })
+      .then(ok => { if (ok === false) lease.lost = true; }, () => {});
+  }, Math.max(10, Math.floor(LOCK_TTL_MS / 3)));
   lease.timer.unref?.();
   return lease;
 }
 async function releaseDbLock(lease) {
   clearInterval(lease.timer);
-  try { await sbx().from("scrapbook_locks").delete().eq("key", lease.key).eq("holder", lease.holder); } catch {}
+  try { await rpcRequired("sp_scrapbook_lock_release", { p_key: lease.key, p_holder: lease.holder, p_fence: lease.fence }); } catch {}
 }
 async function withLock(key, fn) {
   const prev = v2Locks.get(key) || Promise.resolve();
@@ -645,57 +697,35 @@ async function withLock(key, fn) {
   let lease = null;
   try {
     if (dbLocksEnabled()) lease = await acquireDbLock(key);
-    return await fn();
+    if (!lease) return await fn();
+    return await leaseCtx.run([...(leaseCtx.getStore() || []), lease], fn);
   } finally {
     if (lease) await releaseDbLock(lease);
     release(); if (v2Locks.get(key) === tail) v2Locks.delete(key);
   }
 }
 
-// Atomic helpers backed by Postgres functions (supabase-schema.sql 9.7). When
-// a function is not deployed yet (PGRST202 / 42883) the caller falls back to
-// the lock-protected read-modify-write path.
-function rpcMissing(error) { return !!error && ["PGRST202", "42883", "PGRST204"].includes(String(error.code || "")); }
-let warnedRpc = false;
-async function rpcOr(name, params, fallback) {
-  const sb = sbx();
-  if (typeof sb.rpc === "function") {
-    const { data, error } = await sb.rpc(name, params);
-    if (!error) return data;
-    if (!rpcMissing(error)) throw error;
-    if (!warnedRpc) { warnedRpc = true; console.warn(`[SyncParty Scrapbook] ${name}() missing - apply supabase-schema.sql section 9.7. Using lock-protected fallback.`); }
-  }
-  return fallback();
-}
-// totals += deltas, clamped at zero, as ONE statement.
+// totals += deltas, clamped at zero, as ONE statement (9.7). Used only for
+// the legacy (pre-v2 client) shared save and last-watched "touch" updates.
 async function bumpTotals(table, rowId, d, t = now()) {
   const dw = Math.round(Number(d.watch) || 0), dt = Math.round(Number(d.together) || 0), ds = Math.round(Number(d.sessions) || 0);
   if (!dw && !dt && !ds && !d.touch) return;
-  await rpcOr("sp_scrapbook_bump_totals", { p_table: table, p_id: String(rowId), p_watch: dw, p_together: dt, p_sessions: ds, p_at: t }, async () => {
-    const cols = table === "shared_memory_members" ? ["watch_sec", "together_sec", "session_count"]
-      : table === "shared_memories" ? [null, "together_sec", "session_count"]
-      : ["watch_duration_sec", "together_duration_sec", "session_count"];
-    const row = await q(sbx().from(table).select("*").eq("id", String(rowId)).maybeSingle());
-    if (!row) return;
-    const patch = { updated_at: t };
-    [dw, dt, ds].forEach((v, i) => { if (cols[i] && v) patch[cols[i]] = Math.max(0, Number(row[cols[i]] || 0) + v); });
-    if (table !== "scrapbook_entries") patch.last_watched_at = Math.max(Number(row.last_watched_at || 0), t);
-    await q(sbx().from(table).update(patch).eq("id", String(rowId)));
-  });
+  await rpcRequired("sp_scrapbook_bump_totals", { p_table: table, p_id: String(rowId), p_watch: dw, p_together: dt, p_sessions: ds, p_at: t });
 }
 // Both partners' decisions + their co-sitting in ONE transaction: both are
-// written or neither is. Returns true when this call wrote them.
+// written or neither is. The database verifies the two users ARE the
+// chapter's Story partner pair, each sitting is that user's recorded intent
+// and the chapter is still open. Returns true when this call wrote them.
 async function writePairDecision(co, own, partner) {
   const t = now();
   const full = r => ({ decided_at: t, last_active_at: t, reason: "co_watch", ...r });
-  return rpcOr("sp_scrapbook_decide_pair", { p_co: co, p_first: full(partner), p_second: full(own) }, async () => {
-    const { error: coErr } = await sbx().from("co_sittings").insert(co);
-    if (coErr && coErr.code !== "23505") throw coErr;
-    const pd = await writeDecision(partner);
-    if (!(pd && pd.destination === "SHARED" && pd.co_sitting_id === co.id)) return false;
-    const od = await writeDecision(own);
-    return !!(od && od.destination === "SHARED" && od.co_sitting_id === co.id);
-  }).then(v => v === true || (v && v.applied === true));
+  try {
+    const v = await fencedRpc("sp_scrapbook_decide_pair", { p_co: co, p_first: full(partner), p_second: full(own) });
+    return v === true || !!(v && v.applied === true);
+  } catch (e) {
+    if (["SPV01", "SPC01"].includes(String(e.code))) return false;
+    throw e;
+  }
 }
 function coSittingId(chapterId, a, b) {
   return "cos_" + crypto.createHash("sha256").update(`${chapterId}|${[String(a), String(b)].sort().join("|")}`).digest("hex").slice(0, 32);
@@ -784,7 +814,9 @@ async function startChapter(prevRow, activeRow) {
     let list = prevRow ? await ensureChaptersUnlocked(prevRow) : await listChapterRows(activeRow.id);
     const open = list.find(c => c.ended_at == null);
     if (open) return open;
-    return insertChapter(activeRow.id, { legacy: false, startedAt: now() });
+    // Opened while v2 is OFF => its shared watches are v1 rows: flag it legacy
+    // so they stay readable (and backfillable) once v2 is turned ON.
+    return insertChapter(activeRow.id, { legacy: !v2Enabled(), startedAt: now() });
   });
 }
 
@@ -825,6 +857,7 @@ async function activeChapterForUser(userId) {
 }
 
 async function chaptersForUser(userId) {
+  if (!v2Enabled()) return [];
   const rels = (await rawUserRelations(userId)).filter(r => r.accepted_at);
   const out = [];
   for (const rel of rels) {
@@ -963,17 +996,19 @@ function decisionView(d) {
   return d ? { sittingId: d.sitting_id, destination: d.destination, chapterId: d.chapter_id || null, coSittingId: d.co_sitting_id || null, reason: d.reason || null, decidedAt: Number(d.decided_at) } : null;
 }
 async function getDecision(sittingId) { return q(sbx().from("sitting_decisions").select("*").eq("sitting_id", String(sittingId)).maybeSingle()); }
-// Write-once: the first decision stored for a sitting wins forever.
+// Write-once: the first decision stored for a sitting wins forever. The
+// database validates a SHARED decision (Story member, open chapter, co-sitting
+// of that chapter/episode) and refuses it for anyone else.
 async function writeDecision(row) {
   const t = now();
   const full = { decided_at: t, last_active_at: t, chapter_id: null, co_sitting_id: null, ...row };
-  const { error } = await sbx().from("sitting_decisions").insert(full);
-  if (error && error.code !== "23505") throw error;
+  await fencedRpc("sp_scrapbook_write_decision", { p_row: full });
   return getDecision(row.sitting_id);
 }
 function validSittingId(s) { return typeof s === "string" && /^[A-Za-z0-9_-]{8,80}$/.test(s); }
 
 async function recordIntent(userId, { sittingId, sourceKey, roomId = null, playing = false }) {
+  if (!v2Enabled()) return v2Disabled();
   if (!validSittingId(sittingId) || !sourceKey) return { status: 400, error: "Invalid sitting." };
   const t = now();
   const sb = sbx();
@@ -999,6 +1034,7 @@ async function recordIntent(userId, { sittingId, sourceKey, roomId = null, playi
 // fresh, playing, undecided intent for the same episode in the same room ->
 // both become SHARED in ONE new co-sitting; (6) otherwise PERSONAL.
 async function decideSitting(userId, { sittingId, sourceKey, roomId = null }) {
+  if (!v2Enabled()) return v2Disabled();
   sourceKey = String(sourceKey || "").slice(0, 180);
   const intent = await recordIntent(userId, { sittingId, sourceKey, roomId, playing: true });
   if (intent.error) return intent;
@@ -1017,7 +1053,17 @@ async function decideSitting(userId, { sittingId, sourceKey, roomId = null }) {
     if (d) return { ok: true, decision: decisionView(d) };
     const t = now();
     const chapterId = ctx.chapter.id;
-    const mk = (destination, reason, coId = null) => writeDecision({ sitting_id: sittingId, user_id: String(userId), source_key: sourceKey, destination, reason, chapter_id: destination === "SHARED" ? chapterId : null, co_sitting_id: coId });
+    // The database has the final word on SHARED (open chapter, Story member,
+    // matching co-sitting); if it refuses (e.g. the Story ended a moment ago)
+    // the sitting is PERSONAL.
+    const mk = async (destination, reason, coId = null) => {
+      try {
+        return await writeDecision({ sitting_id: sittingId, user_id: String(userId), source_key: sourceKey, destination, reason, chapter_id: destination === "SHARED" ? chapterId : null, co_sitting_id: coId });
+      } catch (e) {
+        if (destination !== "SHARED" || !["SPV01", "SPC01"].includes(String(e.code))) throw e;
+        return writeDecision({ sitting_id: sittingId, user_id: String(userId), source_key: sourceKey, destination: "PERSONAL", reason: "shared_refused" });
+      }
+    };
     const recent = rows => (rows || []).filter(r => t - Number(r.last_active_at || 0) < V2.SITTING_GAP_MS).sort((a, b) => Number(b.last_active_at) - Number(a.last_active_at));
     // Only decisions made inside THIS chapter count: a sitting from before a
     // Story ended/restarted never steers a sitting of the new chapter.
@@ -1089,65 +1135,61 @@ function unionLengthSec(rows) {
   return clustersOf(rows).reduce((n, c) => n + (c.end - c.start) / 1000, 0);
 }
 
-// Each ledger row's credited amounts move by compare-and-set: a delta is
-// applied to the totals only by the one writer whose CAS succeeded, so two
-// instances recomputing the same row can never both add it.
+// Each ledger row's credited amounts move by compare-and-set and the totals
+// change by exactly that delta in the SAME transaction
+// (sp_scrapbook_apply_ledger), so two instances recomputing the same row can
+// never both add it and a crash can never leave a CAS without its delta. A
+// lost CAS means another writer moved the row: re-read and recompute.
 async function recomputeMember(destination, targetId, userId) {
-  const rows = (await q(sbx().from("sitting_ledger").select("*").eq("target_id", targetId).eq("user_id", String(userId)))) || [];
-  let dW = 0, dT = 0, dS = 0;
-  for (const c of clustersOf(rows)) {
-    const len = (c.end - c.start) / 1000;
-    const sumW = c.rows.reduce((n, r) => n + Number(r.watch_sec_cum || 0), 0);
-    const credW = Math.floor(Math.min(sumW, len));
-    const sumT = c.rows.reduce((n, r) => n + Number(r.together_sec_cum || 0), 0);
-    const credT = Math.floor(Math.min(sumT, credW));
-    const w = distribute(credW, c.rows, "watch_sec_cum");
-    const tt = distribute(credT, c.rows, "together_sec_cum");
-    for (let i = 0; i < c.rows.length; i++) {
-      const r = c.rows[i];
-      const nw = w.get(r.sitting_id), nt = tt.get(r.sitting_id), ns = i === 0 ? 1 : 0;
-      const ow = Number(r.applied_watch_sec || 0), ot = Number(r.applied_together_sec || 0), os = Number(r.applied_sessions || 0);
-      if (nw === ow && nt === ot && ns === os) continue;
-      const { data, error } = await sbx().from("sitting_ledger").update({ applied_watch_sec: nw, applied_together_sec: nt, applied_sessions: ns })
-        .eq("sitting_id", r.sitting_id).eq("applied_watch_sec", ow).eq("applied_together_sec", ot).eq("applied_sessions", os).select("sitting_id");
-      if (error) throw error;
-      if (!(Array.isArray(data) ? data.length : data)) continue; // someone else applied this transition
-      dW += nw - ow; dT += nt - ot; dS += ns - os;
-      r.applied_watch_sec = nw; r.applied_together_sec = nt; r.applied_sessions = ns;
-    }
-  }
   const t = now();
-  if (destination === "SHARED") {
-    const m = await ensureMember(targetId, String(userId));
-    await bumpTotals("shared_memory_members", m.id, { watch: dW, together: dT, sessions: dS, touch: true }, t);
-  } else if (dW || dT || dS) {
-    await bumpTotals("scrapbook_entries", targetId, { watch: dW, together: dT, sessions: dS }, t);
+  const memberId = destination === "SHARED" ? (await ensureMember(targetId, String(userId))).id : null;
+  let rows = [];
+  for (let attempt = 0; attempt < 6; attempt++) {
+    rows = (await q(sbx().from("sitting_ledger").select("*").eq("target_id", targetId).eq("user_id", String(userId)))) || [];
+    let lost = false;
+    for (const c of clustersOf(rows)) {
+      const len = (c.end - c.start) / 1000;
+      const sumW = c.rows.reduce((n, r) => n + Number(r.watch_sec_cum || 0), 0);
+      const credW = Math.floor(Math.min(sumW, len));
+      const sumT = c.rows.reduce((n, r) => n + Number(r.together_sec_cum || 0), 0);
+      const credT = Math.floor(Math.min(sumT, credW));
+      const w = distribute(credW, c.rows, "watch_sec_cum");
+      const tt = distribute(credT, c.rows, "together_sec_cum");
+      for (let i = 0; i < c.rows.length; i++) {
+        const r = c.rows[i];
+        const nw = w.get(r.sitting_id), nt = tt.get(r.sitting_id), ns = i === 0 ? 1 : 0;
+        const ow = Number(r.applied_watch_sec || 0), ot = Number(r.applied_together_sec || 0), os = Number(r.applied_sessions || 0);
+        if (nw === ow && nt === ot && ns === os) continue;
+        const applied = await fencedRpc("sp_scrapbook_apply_ledger", {
+          p_sitting_id: r.sitting_id, p_old: { w: ow, t: ot, s: os }, p_new: { w: nw, t: nt, s: ns },
+          p_table: destination === "SHARED" ? "shared_memory_members" : "scrapbook_entries", p_bump_id: destination === "SHARED" ? memberId : targetId, p_at: t
+        });
+        if (applied === true) { r.applied_watch_sec = nw; r.applied_together_sec = nt; r.applied_sessions = ns; }
+        else lost = true;
+      }
+    }
+    if (!lost) break;
   }
+  if (destination === "SHARED") await bumpTotals("shared_memory_members", memberId, { touch: true }, t);
   return rows;
 }
 
 // together(co) = min(max over members of that member's credited together in
-// the co-sitting, wall length of the co-sitting). The memory's together time
-// changes by exactly the change in together(co) (compare-and-set on the
-// co-sitting), so it is recomputed from facts on every save rather than
-// accumulated per request.
+// the co-sitting, wall length of the co-sitting). It moves by compare-and-set
+// on the co-sitting and the memory follows in the same transaction
+// (sp_scrapbook_apply_co), recomputed from facts on every save.
 async function recomputeCo(coId, memoryId) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 6; attempt++) {
     const co = await q(sbx().from("co_sittings").select("*").eq("id", coId).maybeSingle());
-    if (!co) return;
+    if (!co || co.memory_id !== memoryId) return;
     const rows = (await q(sbx().from("sitting_ledger").select("*").eq("co_sitting_id", coId))) || [];
     const byUser = new Map();
     for (const r of rows) byUser.set(r.user_id, (byUser.get(r.user_id) || 0) + Number(r.applied_together_sec || 0));
     const maxT = Math.max(0, ...byUser.values());
     const together = Math.floor(Math.min(maxT, unionLengthSec(rows)));
     const old = Number(co.applied_together_sec || 0);
-    const t = now();
-    const { data, error } = await sbx().from("co_sittings").update({ applied_together_sec: together, last_active_at: Math.max(Number(co.last_active_at || 0), t) })
-      .eq("id", coId).eq("applied_together_sec", old).select("id");
-    if (error) throw error;
-    if (!(Array.isArray(data) ? data.length : data)) continue;
-    await bumpTotals("shared_memories", memoryId, { together: together - old, touch: true }, t);
-    return;
+    if (together === old) return;
+    if (await fencedRpc("sp_scrapbook_apply_co", { p_co_id: coId, p_old: old, p_new: together, p_memory_id: memoryId, p_at: now() }) === true) return;
   }
 }
 
@@ -1166,6 +1208,7 @@ async function removedSince(space, jk, decidedAt) {
 // can only ever land in the shared memory. The seq moves by compare-and-set,
 // so two instances receiving the same or reordered saves apply each once.
 async function saveSitting(userId, body = {}) {
+  if (!v2Enabled()) return v2Disabled();
   const sittingId = String(body.sittingId || "");
   const seq = Math.floor(Number(body.seq));
   const entry = body.entry && typeof body.entry === "object" && !Array.isArray(body.entry) ? body.entry : null;
@@ -1183,61 +1226,61 @@ async function saveSitting(userId, body = {}) {
   return withLock(lockKey, async () => {
     const t = now();
     const view = decisionView(d);
-    let ledger = await q(sbx().from("sitting_ledger").select("*").eq("sitting_id", sittingId).maybeSingle());
+    const ledger = await q(sbx().from("sitting_ledger").select("*").eq("sitting_id", sittingId).maybeSingle());
     if (ledger && seq <= Number(ledger.last_seq)) return { ok: true, duplicate: true, decision: view };
     if (d.destination === "SHARED") {
       const ch = await getChapterRow(d.chapter_id);
       if (!ch) return { ok: true, ignored: "chapter_missing", decision: view };
       if (ch.ended_at != null && (Number(d.decided_at) > Number(ch.ended_at) || t > Number(ch.ended_at) + V2.CLOSED_CHAPTER_GRACE_MS)) return { ok: true, ignored: "chapter_closed", decision: view };
     }
-    let targetId;
-    if (ledger) {
-      targetId = ledger.target_id;
-      const target = d.destination === "SHARED" ? await getMemory(targetId) : await q(sbx().from("scrapbook_entries").select("*").eq("id", targetId).maybeSingle());
-      if (await targetRemoved(d.destination, target)) return { ok: true, ignored: "removed", decision: view };
-      if (d.destination === "SHARED") await ensureSharedMemory(d.chapter_id, entry, sourceKey);
-      else await q(sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, target)).eq("id", targetId));
-    } else {
-      const space = d.destination === "SHARED" ? chapterSpace(d.chapter_id) : personalSpace(String(userId));
-      if (await removedSince(space, journeyKeyOf(entry), d.decided_at)) return { ok: true, ignored: "removed", decision: view };
-      if (d.destination === "SHARED") {
-        const mem = await ensureSharedMemory(d.chapter_id, entry, sourceKey);
-        targetId = mem.id;
-        await ensureMember(mem.id, String(userId));
-        // Exactly one instance links the co-sitting and counts its session.
-        if (d.co_sitting_id) {
-          const { data: linked, error: linkErr } = await sbx().from("co_sittings").update({ memory_id: mem.id }).eq("id", d.co_sitting_id).is("memory_id", null).select("id");
-          if (linkErr) throw linkErr;
-          if (Array.isArray(linked) ? linked.length : linked) await bumpTotals("shared_memories", mem.id, { sessions: 1 }, t);
+    let targetId, jk = journeyKeyOf(entry), gen = null;
+    try {
+      if (ledger) {
+        targetId = ledger.target_id;
+        const target = d.destination === "SHARED" ? await getMemory(targetId) : await q(sbx().from("scrapbook_entries").select("*").eq("id", targetId).maybeSingle());
+        if (await targetRemoved(d.destination, target)) return { ok: true, ignored: "removed", decision: view };
+        if (d.destination === "SHARED") await ensureSharedMemory(d.chapter_id, entry, sourceKey);
+        else {
+          await q(sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, target)).eq("id", targetId));
+          jk = journeyKeyOf(rowToEntry(target)); gen = scopeGeneration(target.scope) || 1;
         }
       } else {
-        targetId = (await ensurePersonalRow(String(userId), entry, sourceKey)).id;
+        const space = d.destination === "SHARED" ? chapterSpace(d.chapter_id) : personalSpace(String(userId));
+        if (await removedSince(space, jk, d.decided_at)) return { ok: true, ignored: "removed", decision: view };
+        if (d.destination === "SHARED") {
+          const mem = await ensureSharedMemory(d.chapter_id, entry, sourceKey);
+          targetId = mem.id;
+          await ensureMember(mem.id, String(userId));
+        } else {
+          const row = await ensurePersonalRow(String(userId), entry, sourceKey);
+          targetId = row.id; gen = scopeGeneration(row.scope) || 1;
+        }
       }
+    } catch (e) {
+      // The database refused to (re)create content in a removed generation.
+      if (String(e.code) === "SPR01") return { ok: true, ignored: "removed", decision: view };
+      throw e;
     }
-    const watchIn = toInt(body.watchSecCum), togetherIn = toInt(body.togetherSecCum);
-    for (let attempt = 0; ; attempt++) {
-      const watch = Math.max(Number(ledger?.watch_sec_cum || 0), watchIn);
-      const together = Math.max(Number(ledger?.together_sec_cum || 0), Math.min(togetherIn, watch));
-      const start = Math.min(ledger ? Number(ledger.interval_start) : Infinity, t - watch * 1000);
-      if (!ledger) {
-        const { error } = await sbx().from("sitting_ledger").insert({
-          sitting_id: sittingId, user_id: String(userId), destination: d.destination, target_id: targetId, co_sitting_id: d.co_sitting_id || null,
-          last_seq: seq, watch_sec_cum: watch, together_sec_cum: together, interval_start: start, interval_end: t,
-          applied_watch_sec: 0, applied_together_sec: 0, applied_sessions: 0, updated_at: t
-        });
-        if (!error) break;
-        if (error.code !== "23505") throw error;
-      } else {
-        const { data, error } = await sbx().from("sitting_ledger").update({ last_seq: seq, watch_sec_cum: watch, together_sec_cum: together, interval_start: start, interval_end: Math.max(Number(ledger.interval_end), t), updated_at: t })
-          .eq("sitting_id", sittingId).lt("last_seq", seq).select("sitting_id");
-        if (error) throw error;
-        if (Array.isArray(data) ? data.length : data) break;
-      }
-      // Another instance moved this ledger row first: re-read and re-check.
-      ledger = await q(sbx().from("sitting_ledger").select("*").eq("sitting_id", sittingId).maybeSingle());
-      if (!ledger || seq <= Number(ledger.last_seq) || attempt >= 4) return { ok: true, duplicate: true, decision: view };
+    // The ledger move itself is ONE database transaction that re-verifies the
+    // decision, owner, target, closed-chapter grace window and removal, and
+    // advances (seq, running totals) monotonically. A stale lock owner is
+    // rejected (SP_FENCED) before anything is written.
+    let res;
+    try {
+      res = await fencedRpc("sp_scrapbook_save_ledger", {
+        p_row: { sitting_id: sittingId, user_id: String(userId), target_id: targetId, watch_cum: toInt(body.watchSecCum), together_cum: toInt(body.togetherSecCum), journey_key: jk, generation: gen, max_age_ms: V2.LEDGER_COMPACT_MS },
+        p_seq: seq, p_now: t, p_grace_ms: V2.CLOSED_CHAPTER_GRACE_MS
+      });
+    } catch (e) {
+      if (String(e.code) === "SPR01") return { ok: true, ignored: "removed", decision: view };
+      throw e;
     }
-    await q(sbx().from("sitting_decisions").update({ last_active_at: t }).eq("sitting_id", sittingId));
+    const status = res && res.status;
+    if (status === "duplicate") return { ok: true, duplicate: true, decision: view };
+    if (status !== "inserted" && status !== "advanced") return { ok: true, ignored: status || "rejected", decision: view };
+    // Exactly one instance links the co-sitting and counts its ONE session
+    // (idempotent: retried until some save of the co-sitting succeeds).
+    if (d.destination === "SHARED" && d.co_sitting_id) await fencedRpc("sp_scrapbook_link_co", { p_co_id: d.co_sitting_id, p_memory_id: targetId, p_at: t });
     await recomputeMember(d.destination, targetId, userId);
     if (d.destination === "SHARED" && d.co_sitting_id) await recomputeCo(d.co_sitting_id, targetId);
     return { ok: true, decision: view, target: { destination: d.destination, id: targetId } };
@@ -1373,7 +1416,53 @@ const PERSONAL_ACTIONS = ["rename", "reset-title", "archive", "unarchive", "remo
 const SHARED_ACTIONS = ["rename", "reset-title", "hide", "unhide", "request-removal", "cancel-removal", "confirm-removal", "decline-removal", "restore"];
 const CLOSED_ALLOWED = ["hide", "unhide", "restore"];
 
+// Is there live (unremoved) content for generation `gen` of a journey? Only
+// then may an action create that generation's state row: a decline / cancel
+// / confirm (or any other action) on an already-removed journey never
+// creates an empty next-generation row.
+async function journeyHasContent(space, jk, gen, chapter = null) {
+  if (space.startsWith("u:")) {
+    const rows = (await q(sbx().from("scrapbook_entries").select("*").eq("user_id", space.slice(2)).eq("scope", personalScope(gen)))) || [];
+    return rows.some(r => journeyKeyOf(rowToEntry(r)) === jk);
+  }
+  const mems = (await q(sbx().from("shared_memories").select("id").eq("chapter_id", space.slice(2)).eq("journey_key", jk).eq("journey_version", Number(gen)))) || [];
+  if (mems.length) return true;
+  if (Number(gen) !== 1 || !chapter) return false;
+  const legacy = (await q(sbx().from("scrapbook_entries").select("*").eq("scope", `shared:${chapter.relation_id}`))) || [];
+  return legacy.some(r => !r.migrated_to_shared_id && journeyKeyOf(rowToEntry(r)) === jk);
+}
+// The state row an action applies to: the latest live generation, or - only
+// for actions that need one and only when that generation has content - a
+// newly created row. Returns null when there is nothing to act on.
+const CREATES_STATE = ["rename", "reset-title", "archive", "unarchive", "remove", "request-removal"];
+async function stateForAction(space, jk, action, chapter = null) {
+  const latest = latestState(await journeyStateRows(space, jk), jk);
+  if (action === "restore") return latest;
+  if (latest && latest.removed_at == null) return latest;
+  if (!CREATES_STATE.includes(action)) return null;
+  const gen = latest ? Number(latest.generation) + 1 : 1;
+  if (!(await journeyHasContent(space, jk, gen, chapter))) return null;
+  return getOrCreateState(space, jk, gen);
+}
+// Every journey_state change is a compare-and-set on the row exactly as it
+// was read (sp_scrapbook_journey_update, fenced): a concurrent change on
+// another instance (confirm vs decline, purge vs restore, expiry vs confirm)
+// makes this one fail with 409 instead of overwriting it.
+const STATE_COLS = ["display_title", "title_edited_by", "title_edited_at", "archived_at", "removed_at", "removed_by", "purge_after", "purged_at", "removal_state", "removal_requested_by", "removal_requested_at", "removal_blocked_until", "updated_at"];
+function expectOf(st) { const e = {}; for (const c of STATE_COLS) e[c] = st[c] === undefined ? null : st[c]; return e; }
+async function casState(st, patch, requireOpen = false) {
+  try {
+    return await fencedRpc("sp_scrapbook_journey_update", { p_state_id: st.id, p_expect: expectOf(st), p_patch: patch, p_require_open: !!requireOpen });
+  } catch (e) {
+    if (String(e.code) === "SPC01") return { error: { status: 409, error: "This chapter has ended and is read-only.", readOnly: true } };
+    if (String(e.code) === "SPR01") return { error: { status: 409, error: "The restore window has passed." } };
+    throw e;
+  }
+}
+const CONFLICT = { status: 409, error: "This memory was just changed; refresh and try again.", conflict: true };
+
 async function journeyAction(userId, body = {}) {
+  if (!v2Enabled()) return v2Disabled();
   const action = String(body.action || "");
   const jk = normJourneyKey(body.journeyKey);
   if (!jk) return { status: 400, error: "Missing journey." };
@@ -1382,10 +1471,8 @@ async function journeyAction(userId, body = {}) {
     if (!PERSONAL_ACTIONS.includes(action)) return { status: 400, error: "Unknown action." };
     const space = personalSpace(userId);
     return withLock(`space:${space}`, async () => {
-      const rows = await journeyStateRows(space, jk);
-      const latest = latestState(rows, jk);
-      let st = action === "restore" ? latest : await getOrCreateState(space, jk, latest && latest.removed_at == null ? latest.generation : latest ? Number(latest.generation) + 1 : 1);
-      if (action !== "restore" && latest && latest.removed_at == null) st = latest;
+      const st = await stateForAction(space, jk, action);
+      if (!st) return action === "restore" ? { status: 409, error: "Nothing to restore." } : { status: 404, error: "Nothing to change for this journey." };
       const patch = await applyCommon(st, action, userId, body, t);
       if (patch.error) return patch;
       if (action === "archive" || action === "unarchive") {
@@ -1397,7 +1484,9 @@ async function journeyAction(userId, body = {}) {
         }
       }
       if (action === "remove") Object.assign(patch, { removed_at: t, removed_by: String(userId), purge_after: t + V2.RESTORE_WINDOW_MS });
-      const saved = await q(sbx().from("journey_state").update({ ...patch, updated_at: t }).eq("id", st.id).select("*").maybeSingle());
+      const saved = await casState(st, { ...patch, updated_at: t });
+      if (saved && saved.error) return saved.error;
+      if (!saved) return CONFLICT;
       await logEvent(space, jk, userId, action, { generation: Number(st.generation) });
       return { ok: true, state: stateView(saved, t) };
     });
@@ -1417,9 +1506,12 @@ async function journeyAction(userId, body = {}) {
       await logEvent(space, jk, userId, action);
       return { ok: true, hidden: action === "hide" };
     }
-    const rows = await journeyStateRows(space, jk);
-    const latest = latestState(rows, jk);
-    const st = action === "restore" ? latest : (latest && latest.removed_at == null ? latest : await getOrCreateState(space, jk, latest ? Number(latest.generation) + 1 : 1));
+    const st = await stateForAction(space, jk, action, chapter);
+    if (!st) {
+      if (action === "restore") return { status: 409, error: "Nothing to restore." };
+      if (["cancel-removal", "confirm-removal", "decline-removal"].includes(action)) return { status: 409, error: "There is no open removal request." };
+      return { status: 404, error: "Nothing to change for this journey." };
+    }
     const patch = await applyCommon(st, action, userId, body, t);
     if (patch.error) return patch;
     const removal = effectiveRemoval(st, t);
@@ -1437,7 +1529,9 @@ async function journeyAction(userId, body = {}) {
       if (action === "confirm-removal") Object.assign(patch, { removed_at: t, removed_by: String(userId), purge_after: t + V2.RESTORE_WINDOW_MS });
       if (action === "decline-removal") patch.removal_blocked_until = t + V2.REMOVAL_COOLDOWN_MS;
     }
-    const saved = await q(sbx().from("journey_state").update({ ...patch, updated_at: t }).eq("id", st.id).select("*").maybeSingle());
+    const saved = await casState(st, { ...patch, updated_at: t }, !CLOSED_ALLOWED.includes(action));
+    if (saved && saved.error) return saved.error;
+    if (!saved) return CONFLICT;
     await logEvent(space, jk, userId, action, { generation: Number(st.generation) });
     return { ok: true, state: stateView(saved, t) };
   });
@@ -1488,50 +1582,36 @@ async function runMaintenance(t = now()) {
   for (const st of states) {
     const r = effectiveRemoval(st, t);
     if (r.state === "expired") {
-      // Only the exact request that expired is cleared (CAS), so a newer
-      // request written by another instance is never wiped.
-      const { data: exp, error: expErr } = await sb.from("journey_state").update({ removal_state: "none", removal_requested_by: null, removal_requested_at: null, removal_blocked_until: r.blockedUntil, updated_at: t })
-        .eq("id", st.id).eq("removal_state", "requested").eq("removal_requested_at", st.removal_requested_at).select("id");
-      if (expErr) throw expErr;
-      if (Array.isArray(exp) ? exp.length : exp) report.expiredRequests++;
+      // Only the exact request that expired is cleared (compare-and-set on
+      // the whole row), so a confirm / decline / newer request that another
+      // instance wrote first is never wiped.
+      const exp = await fencedRpc("sp_scrapbook_journey_update", { p_state_id: st.id, p_expect: expectOf(st), p_patch: { removal_state: "none", removal_requested_by: null, removal_requested_at: null, removal_blocked_until: r.blockedUntil, updated_at: t }, p_require_open: false });
+      if (exp) { report.expiredRequests++; Object.assign(st, exp); }
     }
     if (st.removed_at != null && st.purged_at == null && Number(st.purge_after || 0) <= t) {
-      // Same locks as restore (space) and saves (chapter / user), and the
-      // state is re-read inside them: a restore or save on another instance
-      // can never interleave with a half-done purge.
+      // Same locks as restore (space) and saves (chapter / user); the purge
+      // itself is ONE fenced transaction that re-checks the state row under
+      // FOR UPDATE, deletes the generation's rows, marks it purged and writes
+      // the tombstone - a restore on another instance either wins before it
+      // or fails after it, never interleaves.
       const inner = st.space.startsWith("u:") ? `user:${st.space.slice(2)}` : `chapter:${st.space.slice(2)}`;
       const did = await withLock(`space:${st.space}`, () => withLock(inner, async () => {
-        const cur = await q(sb.from("journey_state").select("*").eq("id", st.id).maybeSingle());
-        if (!cur || cur.removed_at == null || cur.purged_at != null || Number(cur.purge_after || 0) > t) return false;
-        const keys = [];
+        let entryIds = [];
         if (st.space.startsWith("u:")) {
-          const userId = st.space.slice(2);
-          const rows = ((await q(sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", personalScope(st.generation)))) || []).filter(r => journeyKeyOf(rowToEntry(r)) === st.journey_key);
-          for (const r of rows) { keys.push(r.source_key); await q(sb.from("scrapbook_entries").delete().eq("id", r.id)); report.purgedRows++; }
-        } else {
-          const chapterId = st.space.slice(2);
-          const mems = ((await q(sb.from("shared_memories").select("*").eq("chapter_id", chapterId).eq("journey_key", st.journey_key))) || []).filter(m => Number(m.journey_version) === Number(st.generation));
-          for (const m of mems) {
-            keys.push(m.source_key);
-            await q(sb.from("shared_memory_members").delete().eq("memory_id", m.id));
-            await q(sb.from("sitting_ledger").delete().eq("target_id", m.id));
-            await q(sb.from("shared_memories").delete().eq("id", m.id));
-            report.purgedRows++;
-          }
+          const rows = ((await q(sb.from("scrapbook_entries").select("*").eq("user_id", st.space.slice(2)).eq("scope", personalScope(st.generation)))) || []).filter(r => journeyKeyOf(rowToEntry(r)) === st.journey_key);
+          entryIds = rows.map(r => r.id);
         }
-        // CAS on purged_at, then the tombstone: a second instance that
-        // somehow got here finds purged_at already set and stops.
-        const { data: marked, error: markErr } = await sb.from("journey_state").update({ purged_at: t, updated_at: t }).eq("id", st.id).is("purged_at", null).select("id");
-        if (markErr) throw markErr;
-        if (!(Array.isArray(marked) ? marked.length : marked)) return false;
-        await q(sb.from("memory_tombstones").insert({ id: `tomb_${st.id}`, space: st.space, journey_key: st.journey_key, generation: Number(st.generation), source_keys: keys, purged_at: t }));
+        const res = await fencedRpc("sp_scrapbook_purge_journey", { p_state_id: st.id, p_now: t, p_entry_ids: entryIds });
+        if (!(res && res.purged)) return false;
+        report.purgedRows += Number(res.rows || 0);
         return true;
       }));
       if (did) report.purgedJourneys++;
     }
   }
   const old = ((await q(sb.from("sitting_ledger").select("*").lt("updated_at", t - V2.LEDGER_COMPACT_MS))) || []);
-  for (const r of old) { await q(sb.from("sitting_ledger").delete().eq("sitting_id", r.sitting_id)); report.compactedLedger++; }
+  // Conditional delete: a row that was written again meanwhile is kept.
+  for (const r of old) { await q(sb.from("sitting_ledger").delete().eq("sitting_id", r.sitting_id).lt("updated_at", t - V2.LEDGER_COMPACT_MS)); report.compactedLedger++; }
   await q(sb.from("maintenance_runs").insert({ id: id("run"), kind: "scrapbook", started_at: t, finished_at: now(), report }));
   await q(sb.from("maintenance_lease").update({ until_at: 0 }).eq("name", "scrapbook").eq("holder", holder));
   return report;
@@ -1635,6 +1715,7 @@ async function runBackfill({ apply = false } = {}) {
 // display title, so renaming a journey never resurfaces a seen Moment.
 function ymd(ms) { return new Date(ms).toISOString().slice(0, 10); }
 async function buildMoments(userId, t = now()) {
+  if (!v2Enabled()) return [];
   const moments = [];
   const personal = await listPersonalV2(userId, { includeArchived: false });
   const spaces = [{ space: personalSpace(userId), label: "My Scrapbook", entries: personal }];
@@ -1698,6 +1779,7 @@ async function buildMoments(userId, t = now()) {
   return unique.map(m => ({ ...m, seen: seen.has(m.id) })).sort((a, b) => (a.seen - b.seen) || (b.at - a.at)).slice(0, 12);
 }
 async function markMomentsSeen(userId, ids) {
+  if (!v2Enabled()) return { ok: false, ...v2Disabled() };
   const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean).slice(0, 50);
   for (const mid of list) {
     const { error } = await sbx().from("moment_seen").insert({ id: id("seen"), user_id: String(userId), moment_id: mid.slice(0, 400), seen_at: now() });
@@ -1707,8 +1789,9 @@ async function markMomentsSeen(userId, ids) {
 }
 
 module.exports = {
-  V2, v2Enabled, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
+  V2, v2Enabled, v2Disabled, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
   recordIntent, decideSitting, saveSitting, journeyAction, runMaintenance, runBackfill, buildMoments, markMomentsSeen,
+  __testHooks: testHooks,
   id,
   now,
   getUser,

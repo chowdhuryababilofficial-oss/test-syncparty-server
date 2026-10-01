@@ -86,6 +86,29 @@ async function runChecks(store, auth, sb, { tag = crypto.randomBytes(4).toString
     check("old chapter refuses edits (rename -> 409)", rename.status === 409 && rename.readOnly, rename);
     const fresh = await store.listSharedV2(a.id, { chapterId: ctx2.chapter.id });
     check("new chapter does not inherit the old chapter's memory", !fresh.entries.some(e => e.sourceKey === key), fresh.entries.length);
+
+    // Removal in the new chapter: tombstoned content cannot be resurrected and
+    // answering an already-removed journey creates no empty state row.
+    const ch2 = ctx2.chapter.id;
+    const key2 = `spv2val-${tag}:s1e2`, entry2 = { ...entry, sourceKey: key2, episode: 2 };
+    const sc = `spv2val_${tag}_c`, sd = `spv2val_${tag}_d`;
+    await store.recordIntent(b.id, { sittingId: sd, sourceKey: key2, roomId: `spv2val-${tag}-2`, playing: true });
+    const d2 = await store.decideSitting(a.id, { sittingId: sc, sourceKey: key2, roomId: `spv2val-${tag}-2` });
+    const s4 = await store.saveSitting(a.id, { sittingId: sc, seq: 1, watchSecCum: 300, togetherSecCum: 300, entry: entry2 });
+    check("co-watch in the new chapter saves SHARED", d2.decision && d2.decision.destination === "SHARED" && s4.ok && !s4.ignored, { d2, s4 });
+    const JK = store.journeyKeyOf(entry2);
+    const rq = await store.journeyAction(a.id, { space: "chapter", chapterId: ch2, journeyKey: JK, action: "request-removal" });
+    const cf = await store.journeyAction(b.id, { space: "chapter", chapterId: ch2, journeyKey: JK, action: "confirm-removal" });
+    check("removal request + partner confirm removes the journey", rq.ok && cf.ok && cf.state && cf.state.removedAt != null, { rq, cf });
+    const late2 = await store.saveSitting(a.id, { sittingId: sc, seq: 2, watchSecCum: 900, togetherSecCum: 900, entry: entry2 });
+    check("a later save of the removed sitting is ignored (no resurrection)", late2.ok && late2.ignored === "removed", late2);
+    const statesBefore = ((await sb.from("journey_state").select("*").eq("space", `c:${ch2}`)).data || []).length;
+    const dec = await store.journeyAction(b.id, { space: "chapter", chapterId: ch2, journeyKey: JK, action: "decline-removal" });
+    const statesAfter = ((await sb.from("journey_state").select("*").eq("space", `c:${ch2}`)).data || []).length;
+    check("declining on the already-removed journey is refused and creates no state row", dec.status === 409 && statesAfter === statesBefore, { dec, statesBefore, statesAfter });
+    const { data: memRows } = await sb.from("shared_memories").select("*").eq("chapter_id", ch2).eq("source_key", key2);
+    const direct = await sb.from("shared_memory_members").insert({ id: `spv2val_${tag}_mm`, memory_id: memRows[0].id, user_id: b.id, updated_at: Date.now() });
+    check("DB refuses a direct insert into the removed generation (SPR01)", direct.error && direct.error.code === "SPR01", direct.error);
   } finally {
     Date.now = realNow;
   }
@@ -128,9 +151,11 @@ if (require.main === module) {
   (async () => {
     const arg = (process.argv.find(a => a.startsWith("--confirm-staging=")) || "").split("=")[1] || "";
     const url = process.env.SUPABASE_URL || "";
-    let host = ""; try { host = new URL(url).host; } catch {}
-    if (!arg || !host.startsWith(arg + ".")) {
-      console.error("Refusing to run. This script writes synthetic rows. Pass --confirm-staging=<project-ref> matching SUPABASE_URL of a STAGING project or branch.\nFor production use scripts/scrapbook-v2-validate.sql (rollback-only).");
+    let host = "", hostname = ""; try { host = new URL(url).host; hostname = new URL(url).hostname; } catch {}
+    // --local-stack: a local PostgreSQL + PostgREST (tests/pg-local-stack.js) on localhost only.
+    const localStack = process.argv.includes("--local-stack") && ["127.0.0.1", "localhost", "::1"].includes(hostname);
+    if (!localStack && (!arg || !host.startsWith(arg + "."))) {
+      console.error("Refusing to run. This script writes synthetic rows. Pass --confirm-staging=<project-ref> matching SUPABASE_URL of a STAGING project or branch (or --local-stack for a localhost PostgREST).\nFor production use scripts/scrapbook-v2-validate.sql (rollback-only).");
       process.exit(2);
     }
     if (process.env.NODE_ENV === "production") { console.error("Refusing to run with NODE_ENV=production."); process.exit(2); }
