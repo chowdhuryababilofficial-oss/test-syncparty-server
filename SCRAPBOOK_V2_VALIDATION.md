@@ -1,11 +1,21 @@
 # Scrapbook V2 – Postgres validation and deployment procedure
 
-V2 stays **OFF** (`SCRAPBOOK_SHARED_V2` unset / `0`). Nothing here enables it.
+Scrapbook V2 is the **single, authoritative Scrapbook architecture**. There is
+no feature flag any more (`SCRAPBOOK_SHARED_V2` is ignored if still set) and
+no v1 save/read path: Our Story = one shared memory per chapter journey
+(`story_chapters` / `shared_memories` / `shared_memory_members`), My Scrapbook
+= the caller's personal rows (`scrapbook_entries`, scope `personal` /
+`personal:vN` generations), and every lifecycle change goes through journey
+state (rename / archive / remove + 30-day restore / removal requests / purge).
 
-## 1. Schema (required before deploying this build, even with V2 OFF)
-Story chapters are opened/closed on Story start/end regardless of the flag, so
-apply `supabase-schema.sql` sections **9.1–9.8** first (idempotent; re-running
-is safe; applied twice in a row on PostgreSQL 17 without error).
+## 1. Schema (required before deploying this build)
+Apply `supabase-schema.sql` sections **9.1–9.9** (idempotent; re-running is
+safe).
+* 9.9 – final cut-over guard: trigger `scrapbook_entries_v2_only_trg` rejects
+  any NEW v1 per-partner shared copy (insert, or re-scoping a row into
+  `shared:%`) with SQLSTATE `SPV02`; existing legacy rows stay as inert,
+  migrated history and may still get their link/flag columns updated. Also
+  pins `search_path` on `story_chapters_immutable()` (advisor warning).
 * 9.7 – `scrapbook_locks`, `sp_scrapbook_bump_totals`.
 * 9.8 – database-authoritative transitions:
   * leases with **fencing tokens** (`scrapbook_locks.fence`,
@@ -26,14 +36,15 @@ is safe; applied twice in a row on PostgreSQL 17 without error).
     used with V2 ON, which never shipped);
   * execute granted to `service_role` only (revoked from public/anon/authenticated).
 
-With V2 ON the server **fails closed** (HTTP 503, `SP_SCHEMA_MISSING`) if any
+The server **fails closed** (HTTP 503, `SP_SCHEMA_MISSING`) if any
 9.7/9.8 function is missing – there is no unguarded fallback path any more.
 
 ## 2. Database protections – safe on production
 Paste `scripts/scrapbook-v2-validate.sql` into the Supabase SQL editor (or
 `psql -f`). One transaction ending in `ROLLBACK`, synthetic `spv2val_` rows
 only, never touches existing data.
-Expected: `SCRAPBOOK V2 VALIDATION: ALL 31 CHECKS PASSED`.
+Expected: `SCRAPBOOK V2 VALIDATION: ALL 33 CHECKS PASSED` (checks 30–31: the
+9.9 guard).
 
 ## 3. Application rules – staging / Supabase branch ONLY
 ```
@@ -72,46 +83,65 @@ SP_PG_ADMIN_URL=postgres://postgres@127.0.0.1:5432/postgres SP_POSTGREST_BIN=$(w
 NODE_PATH=<dir with pg, @supabase/supabase-js> node tests/scrapbook-v2-concurrency-pg.test.js
 ```
 
-## 6. Deployment order
-1. Apply `supabase-schema.sql` (9.1–9.8) to the Supabase project.
-2. Run `scripts/scrapbook-v2-validate.sql` there (rollback-only) – must report ALL 31 CHECKS PASSED.
-3. Deploy this server build with `SCRAPBOOK_SHARED_V2` unset (V2 OFF).
-4. On a staging project/branch with the same schema: `scrapbook-v2-validate.js`
-   and `scrapbook-v2-concurrency.js` (sections 3–4), all green.
+## 6. Deployment order (final architecture)
+1. Apply `supabase-schema.sql` (9.1–9.9) to the Supabase project.
+2. Run `scripts/scrapbook-v2-validate.sql` there (rollback-only) – must report
+   ALL 33 CHECKS PASSED.
+3. Migrate existing v1 data once: `node scripts/scrapbook-v2-backfill.js`
+   (dry run, prints the plan) then `node scripts/scrapbook-v2-backfill.js
+   --apply`. It creates one legacy chapter per pre-chapter Story, folds each
+   episode's per-partner v1 shared copies into ONE chapter memory (per-member
+   watch preserved, together/sessions = max, not summed), links every v1 row
+   (`migrated_to_shared_id`), flags pure personal twins and folds whole-journey
+   archive flags. Never deletes or rewrites row content. A re-run must report
+   0 rows. (Safety net: an Our Story read of a legacy chapter migrates any
+   straggler v1 rows of that Story the same way, under a lock.)
+4. Deploy this server build (no Scrapbook env flag needed).
 5. Ship the extension build.
-6. Only later, as a separate decision: enable `SCRAPBOOK_SHARED_V2=1`, then
-   run `node scripts/scrapbook-v2-backfill.js` (dry run) and
-   `node scripts/scrapbook-v2-backfill.js --apply` once, to fold v1 shared
-   copies written while V2 was OFF into their chapter memories.
 
-## 7. Kill switch (V2 OFF, and an ON -> OFF flip)
-With `SCRAPBOOK_SHARED_V2` unset/0 the v2-only routes
-(`/api/scrapbook/sittings/*`, `/journeys/action`, `/chapters`, `/moments`,
-`/moments/seen`) answer `503 {ok:false, code:"SCRAPBOOK_V2_DISABLED",
-sharedV2:false}` before any storage access, and the same guard sits inside the
-store functions. A backed-up sitting sent to `/entries/bulk` is refused, never
-re-saved as a v1 personal entry. A client caught mid-sitting by an ON -> OFF
-flip keeps its envelope in its separate v2 backup (503 = retryable) and it
-lands exactly once if V2 is turned back ON. V1 save/list/remove/highlights use
-the v1 table only. Chapter rows are still maintained on Story start/end while
-OFF (boundary bookkeeping only); chapters opened while OFF are flagged
-`legacy`, so their v1 shared copies stay readable after V2 is turned ON.
-Regression: `tests/scrapbook-v2-killswitch.test.js` (in-memory, or a real DB
-with `SP_TEST_REAL=1`).
+## 7. Single architecture – what replaced the v1 paths
+* `GET /api/scrapbook` reads V2 only (`listSharedV2` / `listPersonalV2`).
+* `POST /api/scrapbook/entries` scope `shared` (manual /keep "Our Story", and
+  extensions installed before the sitting client) is folded into the chapter's
+  one shared memory for the CALLER only (`directSharedSave`) – never a copy
+  per partner, never a personal twin. Scope `personal` writes the current
+  journey generation (a removed/purged generation is never resurrected).
+* `/entries/bulk`: backed-up sitting envelopes always go through `saveSitting`;
+  device-only (signed-out) memories land in V2 My Scrapbook.
+* `/entries/remove` = V2 soft remove (30-day restore, tombstoned purge) –
+  no hard delete.
+* Highlights, reconcile and Moments read V2 storage.
+* `GET /api/scrapbook/capabilities` stays as a compatibility handshake for
+  installed extensions and always answers `sharedV2:true`.
+* Extension: signed in, every automatic save is ONE sitting save (server
+  decides My Scrapbook vs Our Story); player iframes relay check-ins so the top
+  frame sends intents, decides and accrues Together Time for embedded players;
+  /keep saves to exactly one place; signed out = device-only, uploaded on
+  sign-in.
+Regression: `tests/scrapbook-v2-final.test.js` (in-memory, or a real DB with
+`SP_TEST_REAL=1`).
 
 ## What has and has not been verified
 * Verified on **real PostgreSQL 17.10 + PostgREST 12.2.3 + @supabase/supabase-js**
   (local, Supabase roles/privileges emulated): schema applies twice; validation
-  SQL 31/31 and fully rolled back; negative controls (resurrection trigger
+  SQL fully rolled back; negative controls (resurrection trigger
   dropped, fence check disabled, Story-pair check disabled) each make it fail;
   validate.js 20/20; multi-process concurrency 42/42 (4 processes, locks ON and
   OFF, plus 16-connection SQL phase); anon cannot execute the functions and
   sees no rows (RLS).
 * Verified on the **real Supabase dev project** (PostgreSQL 17.6, via the
-  Supavisor pooler + PostgREST 12.2.3 with the service role): schema 9.1–9.8
-  applied; validation SQL 31/31 (rolled back); validate.js 20/20;
-  multi-process concurrency harness; kill switch 39/39; end-to-end scenarios
-  `tests/scrapbook-v2-real-e2e.test.js` 45/45.
+  Supavisor pooler + PostgREST 12.2.3 with the service role): schema 9.1–9.9
+  applied (9.9 as migration `syncparty_scrapbook_v2_9_9_single_architecture`);
+  validation SQL 33/33 (rolled back); security advisors: no warnings (only the
+  by-design INFO "RLS enabled, no policies" on backend-only tables); backfill
+  dry-run → apply → re-run 0 on the real data (4 relations, 4 legacy
+  chapters, 6 v1 shared rows → 3 memories / 6 members, 1 twin flagged; row
+  content hash unchanged; member watch = v1 watch, together = max);
+  validate.js 20/20; final-architecture suite 18/18; end-to-end scenarios
+  `tests/scrapbook-v2-real-e2e.test.js` 52/52; multi-process concurrency 35/35
+  (4 workers, 5 trials); real client smoke `tests/scrapbook-v2-real-client.test.js`
+  10/10 (top-frame solo, cross-origin iframe co-watch with Together Time,
+  /keep). All synthetic test users removed afterwards.
 * Lock wait: `SCRAPBOOK_LOCK_WAIT_MS` (default 10000) must exceed the time a
   save holds its lock. At ~350 ms per database round trip (far client) four
   simultaneous saves of one sitting can exceed 10 s and get a retryable 503;

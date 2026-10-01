@@ -298,6 +298,22 @@ begin
   if not ok then raise exception 'SCRAPBOOK V2 VALIDATION FAILED: RLS disabled on a v2 table'; end if;
   n := n + 1;
 
+  -- 30. V2-only cut-over (9.9): no new v1 per-partner shared copy can be written
+  begin
+    insert into public.scrapbook_entries (id, user_id, scope, relation_id, source_key, title, kind, status, first_watched_at, last_watched_at, created_at, updated_at)
+      values ('spv2val_v1s', 'spv2val_u1', 'shared:spv2val_rel', 'spv2val_rel', 'k:v1', 'v1', 'movie', 'watching', 0, 0, 0, 0);
+    raise exception 'SCRAPBOOK V2 VALIDATION FAILED: v1 shared copy insert accepted';
+  exception when sqlstate 'SPV02' then n := n + 1; end;
+
+  -- 31. a personal (V2) row is still writable, but cannot be re-scoped into v1
+  insert into public.scrapbook_entries (id, user_id, scope, source_key, title, kind, status, first_watched_at, last_watched_at, created_at, updated_at)
+    values ('spv2val_p1', 'spv2val_u1', 'personal', 'k:p1', 'p1', 'movie', 'watching', 0, 0, 0, 0);
+  update public.scrapbook_entries set watch_duration_sec = 5 where id = 'spv2val_p1';
+  begin
+    update public.scrapbook_entries set scope = 'shared:spv2val_rel' where id = 'spv2val_p1';
+    raise exception 'SCRAPBOOK V2 VALIDATION FAILED: personal row re-scoped into v1 shared';
+  exception when sqlstate 'SPV02' then n := n + 1; end;
+
   raise notice 'SCRAPBOOK V2 VALIDATION: ALL % CHECKS PASSED', n;
 end $$;
 

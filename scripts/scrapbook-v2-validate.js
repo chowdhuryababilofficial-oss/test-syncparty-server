@@ -159,7 +159,6 @@ if (require.main === module) {
       process.exit(2);
     }
     if (process.env.NODE_ENV === "production") { console.error("Refusing to run with NODE_ENV=production."); process.exit(2); }
-    process.env.SCRAPBOOK_SHARED_V2 = "1"; // this process only
     const path = require("path");
     const store = require(path.join(__dirname, "..", "scrapbook-store.js"));
     const auth = require(path.join(__dirname, "..", "auth-store.js"));

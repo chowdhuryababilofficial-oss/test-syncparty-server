@@ -227,51 +227,18 @@ async function listUserRelations(userId) {
   return Promise.all((data || []).map(relationView));
 }
 
-// includeArchived lets the Scrapbook show archived memories read-only in its
-// "Archived" filter. Default stays active-only so existing callers are
-// unaffected.
-async function listPersonalEntries(userId, limit = 150, includeArchived = true) {
-  const sb = getSupabaseAdmin();
-  let q = sb.from("scrapbook_entries")
-    .select("*")
-    .eq("user_id", userId)
-    .eq("scope", "personal")
-    .order("last_watched_at", { ascending: false })
-    .limit(limit);
-  if (!includeArchived) q = q.is("archived_at", null);
-  const { data, error } = await q;
-  if (error) throw error;
-  return (data || []).map(rowToEntry);
-}
-
-async function listSharedEntries(userId, relationId = null, limit = 150, includeArchived = true) {
-  const sb = getSupabaseAdmin();
-  let q = sb.from("scrapbook_entries")
-    .select("*")
-    .eq("user_id", userId)
-    .like("scope", "shared:%")
-    .order("last_watched_at", { ascending: false })
-    .limit(limit);
-  if (relationId) q = q.eq("relation_id", relationId);
-  if (!includeArchived) q = q.is("archived_at", null);
-  const { data, error } = await q;
-  if (error) throw error;
-  return (data || []).map(rowToEntry);
-}
-
 async function upsertEntry(userId, entry, sharedRelationId = null) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
   const sourceKey = String(entry.sourceKey || "").slice(0, 180);
   if (!sourceKey) return null;
-  if (sharedRelationId && v2Enabled()) return legacySharedSave(userId, sharedRelationId, { ...entry, sourceKey });
-  // Rollout safety (v2): an old-format personal save must follow the journey
-  // generation rules. A removed / purged (tombstoned) generation is never
-  // written again - the save lands in a fresh generation instead of
-  // resurrecting what the person deleted.
-  let scope = sharedRelationId ? `shared:${sharedRelationId}` : "personal";
-  if (!sharedRelationId && v2Enabled()) {
-    scope = personalScope(await currentGeneration(personalSpace(userId), journeyKeyOf({ ...entry, sourceKey })));
-  }
+  // Our Story: a direct shared save (manual /keep, older clients) is folded
+  // into the chapter's ONE shared memory - never a v1 'shared:' copy.
+  if (sharedRelationId) return directSharedSave(userId, sharedRelationId, { ...entry, sourceKey });
+  // My Scrapbook: a direct personal save follows the journey generation
+  // rules. A removed / purged (tombstoned) generation is never written again
+  // - the save lands in a fresh generation instead of resurrecting what the
+  // person deleted.
+  const scope = personalScope(await currentGeneration(personalSpace(userId), journeyKeyOf({ ...entry, sourceKey })));
   const sb = getSupabaseAdmin();
   const { data: existing, error: findError } = await sb.from("scrapbook_entries")
     .select("*")
@@ -509,16 +476,13 @@ async function reopenRelation(relationId, userId) {
 // so the Sync & Backup panel can show real confirmed/pending/failed state
 // instead of guessing. Read-only: it never writes entries.
 async function reconcileEntries(userId, entries = []) {
-  const stored = await listPersonalEntries(userId, 300);
-  const sharedStored = await listSharedEntries(userId, null, 300);
+  const stored = await listPersonalV2(userId, { includeArchived: true, includeTwins: true });
   const byKey = new Map();
-  // Personal wins on a tie; shared fills in memories that only live in an
-  // Our Story scope, which previously always read back as "pending".
-  for (const e of sharedStored) byKey.set(e.sourceKey, e);
-  if (v2Enabled()) {
-    const chapters = await chaptersForUser(userId);
-    for (const c of chapters) for (const e of (await listSharedV2(userId, { chapterId: c.id, includeHidden: true })).entries) if (!byKey.has(e.sourceKey)) byKey.set(e.sourceKey, e);
-  }
+  // Personal wins on a tie; Our Story chapter memories fill in watches that
+  // only live in a shared memory, which otherwise read back as "pending".
+  let sharedCount = 0;
+  const chapters = await chaptersForUser(userId);
+  for (const c of chapters) for (const e of (await listSharedV2(userId, { chapterId: c.id, includeHidden: true })).entries) { sharedCount++; if (!byKey.has(e.sourceKey)) byKey.set(e.sourceKey, e); }
   for (const e of stored) byKey.set(e.sourceKey, e);
   const out = [];
   for (const candidate of (Array.isArray(entries) ? entries.slice(0, 500) : [])) {
@@ -535,7 +499,7 @@ async function reconcileEntries(userId, entries = []) {
     const behind = clientSec > (Number(match.watchDurationSec) || 0) + 1;
     out.push({ sourceKey, state: behind ? "pending" : "synced", id: match.id });
   }
-  return { entries: out, reconciledAt: now(), storedCount: stored.length, sharedCount: sharedStored.length };
+  return { entries: out, reconciledAt: now(), storedCount: stored.length, sharedCount };
 }
 
 // Archive/restore or remove specific entries the user owns. Archiving keeps
@@ -559,20 +523,16 @@ async function removeEntries(userId, entryIds) {
   const sb = getSupabaseAdmin();
   const { data, error } = await sb.from("scrapbook_entries").select("*").eq("user_id", userId).in("id", ids);
   if (error) throw error;
-  if (!v2Enabled()) {
-    // v1 (v2 OFF): the caller's own personal rows are removed from the v1
-    // table the v1 list reads. Never touches v2 journey state.
-    const own = (data || []).filter(r => r.scope === "personal").map(r => r.id);
-    if (own.length) { const { error: de } = await sb.from("scrapbook_entries").delete().eq("user_id", userId).eq("scope", "personal").in("id", own); if (de) throw de; }
-    return { removed: own.length, soft: false };
-  }
+  // Always the V2 journey removal: soft remove (restorable for 30 days,
+  // purged by maintenance afterwards), tombstoned so no later save of the
+  // same journey can resurrect it.
   const keys = [...new Set((data || []).filter(r => scopeGeneration(r.scope) != null).map(r => journeyKeyOf(rowToEntry(r))))];
   for (const journeyKey of keys) await journeyAction(userId, { space: "personal", journeyKey, action: "remove" });
   return { removed: (data || []).length, soft: true };
 }
 
 async function getHighlights(userId) {
-  const entries = v2Enabled() ? await listPersonalV2(userId, { includeArchived: true }) : await listPersonalEntries(userId, 300, true);
+  const entries = await listPersonalV2(userId, { includeArchived: true });
   const totalSec = entries.reduce((n, e) => n + (e.watchDurationSec || 0), 0);
   return {
     totalEntries: entries.length,
@@ -601,19 +561,12 @@ const V2 = {
   LEDGER_COMPACT_MS: 90 * 86400000,
   LEASE_MS: 10 * 60 * 1000
 };
-// OFF until the v2 client (sitting saves) ships: the current extension still
-// sends v1 dual personal+shared saves. Set SCRAPBOOK_SHARED_V2=1 to enable.
-function v2Enabled() { return String(process.env.SCRAPBOOK_SHARED_V2 ?? "0") === "1"; }
-// Hard server-side kill switch. With v2 OFF no v2-only entry point reads or
-// writes v2 storage, so a client still mid-sitting after an ON -> OFF flip is
-// refused (503, retryable: the client keeps its envelope in its separate v2
-// backup) and is never re-routed into the v1 tables.
-const V2_DISABLED_ERROR = "Shared Scrapbook v2 is disabled on this server.";
-function v2Disabled() { return { status: 503, code: "SCRAPBOOK_V2_DISABLED", error: V2_DISABLED_ERROR, v2Disabled: true }; }
+// Scrapbook V2 is the single Scrapbook architecture: there is no feature
+// flag and no v1 storage path any more (SCRAPBOOK_SHARED_V2 is ignored).
 
 const v2Locks = new Map();
 // Cross-instance mutual exclusion WITH FENCING. The in-process queue orders
-// work inside one Node process; when v2 is on, the same key is ALSO held as a
+// work inside one Node process; the same key is ALSO held as a
 // row in public.scrapbook_locks (sp_scrapbook_lock_acquire: insert, or take
 // over an EXPIRED lease, in one statement) and every acquisition returns a
 // strictly increasing fence number. The fences held by the current async
@@ -635,7 +588,7 @@ function heldFences() {
   const held = leaseCtx.getStore();
   return held && held.length ? held.map(l => ({ k: l.key, f: l.fence })) : null;
 }
-function dbLocksEnabled() { return v2Enabled() && String(process.env.SCRAPBOOK_DB_LOCKS ?? "1") !== "0"; }
+function dbLocksEnabled() { return String(process.env.SCRAPBOOK_DB_LOCKS ?? "1") !== "0"; }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function rpcMissing(error) { return !!error && ["PGRST202", "42883", "PGRST204"].includes(String(error.code || "")); }
 function schemaError(name) {
@@ -814,9 +767,7 @@ async function startChapter(prevRow, activeRow) {
     let list = prevRow ? await ensureChaptersUnlocked(prevRow) : await listChapterRows(activeRow.id);
     const open = list.find(c => c.ended_at == null);
     if (open) return open;
-    // Opened while v2 is OFF => its shared watches are v1 rows: flag it legacy
-    // so they stay readable (and backfillable) once v2 is turned ON.
-    return insertChapter(activeRow.id, { legacy: !v2Enabled(), startedAt: now() });
+    return insertChapter(activeRow.id, { legacy: false, startedAt: now() });
   });
 }
 
@@ -857,7 +808,6 @@ async function activeChapterForUser(userId) {
 }
 
 async function chaptersForUser(userId) {
-  if (!v2Enabled()) return [];
   const rels = (await rawUserRelations(userId)).filter(r => r.accepted_at);
   const out = [];
   for (const rel of rels) {
@@ -1008,7 +958,6 @@ async function writeDecision(row) {
 function validSittingId(s) { return typeof s === "string" && /^[A-Za-z0-9_-]{8,80}$/.test(s); }
 
 async function recordIntent(userId, { sittingId, sourceKey, roomId = null, playing = false }) {
-  if (!v2Enabled()) return v2Disabled();
   if (!validSittingId(sittingId) || !sourceKey) return { status: 400, error: "Invalid sitting." };
   const t = now();
   const sb = sbx();
@@ -1034,7 +983,6 @@ async function recordIntent(userId, { sittingId, sourceKey, roomId = null, playi
 // fresh, playing, undecided intent for the same episode in the same room ->
 // both become SHARED in ONE new co-sitting; (6) otherwise PERSONAL.
 async function decideSitting(userId, { sittingId, sourceKey, roomId = null }) {
-  if (!v2Enabled()) return v2Disabled();
   sourceKey = String(sourceKey || "").slice(0, 180);
   const intent = await recordIntent(userId, { sittingId, sourceKey, roomId, playing: true });
   if (intent.error) return intent;
@@ -1208,7 +1156,6 @@ async function removedSince(space, jk, decidedAt) {
 // can only ever land in the shared memory. The seq moves by compare-and-set,
 // so two instances receiving the same or reordered saves apply each once.
 async function saveSitting(userId, body = {}) {
-  if (!v2Enabled()) return v2Disabled();
   const sittingId = String(body.sittingId || "");
   const seq = Math.floor(Number(body.seq));
   const entry = body.entry && typeof body.entry === "object" && !Array.isArray(body.entry) ? body.entry : null;
@@ -1287,10 +1234,11 @@ async function saveSitting(userId, body = {}) {
   });
 }
 
-// Old (pre-v2) clients still POST delta saves with scope 'shared'. They are
-// folded into the chapter's shared memory (member totals += deltas; memory
-// together/sessions follow the max member) instead of creating a copy.
-async function legacySharedSave(userId, relationId, entry) {
+// Direct shared saves (POST /entries scope 'shared': manual /keep "Our Story",
+// and delta saves from extensions installed before the sitting client) are
+// folded into the chapter's ONE shared memory (member totals += deltas;
+// memory together/sessions follow the max member). Never a per-partner copy.
+async function directSharedSave(userId, relationId, entry) {
   const rel = await getRelationById(relationId);
   if (!rel || ![rel.user1_id, rel.user2_id].map(String).includes(String(userId)) || !isActiveRelationRow(rel)) return null;
   const sourceKey = String(entry.sourceKey || "").slice(0, 180);
@@ -1387,6 +1335,10 @@ async function listSharedV2(userId, { chapterId = null, relationId = null, inclu
   const chapters = await chaptersForUser(userId);
   const picked = pickChapter(chapters, { chapterId, relationId });
   if (!picked) return { entries: [], chapter: null, chapters };
+  // A pre-chapter (legacy) Story whose v1 shared copies were not backfilled
+  // yet is migrated into V2 storage now, so Our Story is only ever read
+  // from shared memories (never from v1 rows).
+  if (picked.legacy) await migrateLegacyRelation(picked.relationId);
   const chapter = await getChapterRow(picked.id);
   const mems = (await q(sbx().from("shared_memories").select("*").eq("chapter_id", chapter.id))) || [];
   const members = mems.length ? ((await q(sbx().from("shared_memory_members").select("*").in("memory_id", mems.map(m => m.id)))) || []) : [];
@@ -1395,21 +1347,9 @@ async function listSharedV2(userId, { chapterId = null, relationId = null, inclu
   const prefs = (await q(sbx().from("journey_member_prefs").select("*").eq("space", space).eq("user_id", String(userId)))) || [];
   const t = now();
   let entries = memoryToEntries(mems, userId, chapter, members, states, prefs, t);
-  if (legacyReadsEnabled() && picked.legacy) {
-    const legacyRows = ((await q(sbx().from("scrapbook_entries").select("*").eq("user_id", String(userId)).eq("scope", `shared:${chapter.relation_id}`))) || [])
-      .filter(r => !r.migrated_to_shared_id);
-    for (const r of legacyRows) {
-      const e = rowToEntry(r);
-      const jk = journeyKeyOf(e);
-      const st = states.find(s => s.journey_key === jk && Number(s.generation) === 1);
-      const pref = prefs.find(p => p.journey_key === jk);
-      entries.push({ ...e, shared: true, chapterId: chapter.id, journeyKey: jk, journeyVersion: 1, members: [], displayTitle: st?.display_title || null, journeyState: stateView(st, t), hidden: !!pref?.hidden_at, readOnly: chapter.ended_at != null, legacy: true, legacyUnmigrated: true });
-    }
-  }
   entries = entries.filter(e => (includeHidden || !e.hidden) && (includeRemoved || !(e.journeyState && e.journeyState.removedAt != null)));
   return { entries: entries.sort((a, b) => b.lastWatchedAt - a.lastWatchedAt), chapter: { ...picked }, chapters };
 }
-function legacyReadsEnabled() { return String(process.env.SCRAPBOOK_LEGACY_SHARED_READS ?? "1") !== "0"; }
 
 // ------------------------------------------------------ journey actions
 const PERSONAL_ACTIONS = ["rename", "reset-title", "archive", "unarchive", "remove", "restore"];
@@ -1426,10 +1366,7 @@ async function journeyHasContent(space, jk, gen, chapter = null) {
     return rows.some(r => journeyKeyOf(rowToEntry(r)) === jk);
   }
   const mems = (await q(sbx().from("shared_memories").select("id").eq("chapter_id", space.slice(2)).eq("journey_key", jk).eq("journey_version", Number(gen)))) || [];
-  if (mems.length) return true;
-  if (Number(gen) !== 1 || !chapter) return false;
-  const legacy = (await q(sbx().from("scrapbook_entries").select("*").eq("scope", `shared:${chapter.relation_id}`))) || [];
-  return legacy.some(r => !r.migrated_to_shared_id && journeyKeyOf(rowToEntry(r)) === jk);
+  return mems.length > 0;
 }
 // The state row an action applies to: the latest live generation, or - only
 // for actions that need one and only when that generation has content - a
@@ -1462,7 +1399,6 @@ async function casState(st, patch, requireOpen = false) {
 const CONFLICT = { status: 409, error: "This memory was just changed; refresh and try again.", conflict: true };
 
 async function journeyAction(userId, body = {}) {
-  if (!v2Enabled()) return v2Disabled();
   const action = String(body.action || "");
   const jk = normJourneyKey(body.journeyKey);
   if (!jk) return { status: 400, error: "Missing journey." };
@@ -1622,10 +1558,12 @@ async function runMaintenance(t = now()) {
 // legacy row's content: legacy shared copies are only LINKED to the merged
 // memory, personal twins only FLAGGED, archive flags only FOLDED into new
 // journey state rows. A second run finds nothing left to do.
-async function runBackfill({ apply = false } = {}) {
+async function runBackfill({ apply = false, relationId = null } = {}) {
   const sb = sbx();
   const report = { mode: apply ? "apply" : "dry-run", relations: 0, legacyChaptersCreated: 0, legacySharedRows: 0, memoriesCreated: 0, memoriesMerged: 0, rowsLinked: 0, twinsFlagged: 0, archiveFolded: 0, partialArchiveJourneys: 0, skipped: [] };
-  const rels = ((await q(sb.from("relations").select(RELATION_COLUMNS))) || []).filter(r => r.accepted_at);
+  let relQuery = sb.from("relations").select(RELATION_COLUMNS);
+  if (relationId) relQuery = relQuery.eq("id", String(relationId));
+  const rels = ((await q(relQuery)) || []).filter(r => r.accepted_at);
   report.relations = rels.length;
   const chapterFor = new Map();
   for (const rel of rels) {
@@ -1636,7 +1574,7 @@ async function runBackfill({ apply = false } = {}) {
       else chapterFor.set(rel.id, { id: `(new legacy chapter for ${rel.id})`, started_at: Number(rel.accepted_at), ended_at: isActiveRelationRow(rel) ? null : Number(rel.ended_at || rel.archived_at || now()), dry: true });
     } else chapterFor.set(rel.id, list.find(c => c.legacy) || list[0]);
   }
-  const legacy = ((await q(sb.from("scrapbook_entries").select("*").like("scope", "shared:%"))) || []).filter(r => !r.migrated_to_shared_id);
+  const legacy = ((await q(relationId ? sb.from("scrapbook_entries").select("*").eq("scope", `shared:${relationId}`) : sb.from("scrapbook_entries").select("*").like("scope", "shared:%"))) || []).filter(r => !r.migrated_to_shared_id);
   report.legacySharedRows = legacy.length;
   const groups = new Map();
   for (const r of legacy) {
@@ -1688,6 +1626,9 @@ async function runBackfill({ apply = false } = {}) {
       }
     }
   }
+  // The lazy per-relation migration (Our Story read) only links shared copies;
+  // folding personal archive flags is part of the full backfill run.
+  if (relationId) return report;
   const personal = (await q(sb.from("scrapbook_entries").select("*").eq("scope", "personal"))) || [];
   const journeys = new Map();
   for (const r of personal) {
@@ -1710,12 +1651,21 @@ async function runBackfill({ apply = false } = {}) {
   return report;
 }
 
+// Lazy, per-relation form of the backfill: links any not-yet-migrated v1
+// shared copies of one legacy Story into its chapter memories. Serialized on
+// the relation so two partners opening Our Story at once migrate it once.
+async function migrateLegacyRelation(relationId) {
+  if (!relationId) return null;
+  const pending = ((await q(sbx().from("scrapbook_entries").select("id,migrated_to_shared_id").eq("scope", `shared:${relationId}`))) || []).filter(r => !r.migrated_to_shared_id);
+  if (!pending.length) return null;
+  return withLock(`legacy-migrate:${relationId}`, () => runBackfill({ apply: true, relationId }));
+}
+
 // ---------------------------------------------------------------- Moments
 // Stable ids: type | space | journey_key | period. They never contain a
 // display title, so renaming a journey never resurfaces a seen Moment.
 function ymd(ms) { return new Date(ms).toISOString().slice(0, 10); }
 async function buildMoments(userId, t = now()) {
-  if (!v2Enabled()) return [];
   const moments = [];
   const personal = await listPersonalV2(userId, { includeArchived: false });
   const spaces = [{ space: personalSpace(userId), label: "My Scrapbook", entries: personal }];
@@ -1779,7 +1729,6 @@ async function buildMoments(userId, t = now()) {
   return unique.map(m => ({ ...m, seen: seen.has(m.id) })).sort((a, b) => (a.seen - b.seen) || (b.at - a.at)).slice(0, 12);
 }
 async function markMomentsSeen(userId, ids) {
-  if (!v2Enabled()) return { ok: false, ...v2Disabled() };
   const list = (Array.isArray(ids) ? ids : []).map(String).filter(Boolean).slice(0, 50);
   for (const mid of list) {
     const { error } = await sbx().from("moment_seen").insert({ id: id("seen"), user_id: String(userId), moment_id: mid.slice(0, 400), seen_at: now() });
@@ -1789,7 +1738,7 @@ async function markMomentsSeen(userId, ids) {
 }
 
 module.exports = {
-  V2, v2Enabled, v2Disabled, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
+  V2, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
   recordIntent, decideSitting, saveSitting, journeyAction, runMaintenance, runBackfill, buildMoments, markMomentsSeen,
   __testHooks: testHooks,
   id,
@@ -1807,8 +1756,6 @@ module.exports = {
   reconcileEntries,
   setEntriesArchived,
   removeEntries,
-  listPersonalEntries,
-  listSharedEntries,
   upsertEntry,
   createInvite,
   listInvites,

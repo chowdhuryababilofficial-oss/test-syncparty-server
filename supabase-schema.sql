@@ -301,7 +301,7 @@ create unique index if not exists story_chapters_one_open_idx on public.story_ch
 -- A closed chapter can never be changed, reopened or deleted. An open
 -- chapter's only legal change is being closed (ended_at / end_mode /
 -- ended_by); its identity (id, relation, number, start, legacy) is fixed.
-create or replace function public.story_chapters_immutable() returns trigger language plpgsql as $$
+create or replace function public.story_chapters_immutable() returns trigger language plpgsql set search_path = public as $$
 begin
   if old.ended_at is not null then
     raise exception 'story chapter % is closed and read-only', old.id using errcode = 'P0001';
@@ -1010,3 +1010,24 @@ grant execute on function public.sp_scrapbook_apply_co(text, bigint, bigint, tex
 grant execute on function public.sp_scrapbook_link_co(text, text, bigint, jsonb) to service_role;
 grant execute on function public.sp_scrapbook_journey_update(text, jsonb, jsonb, boolean, jsonb) to service_role;
 grant execute on function public.sp_scrapbook_purge_journey(text, bigint, jsonb, jsonb) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 9.9 Scrapbook V2 is the only Scrapbook architecture (final cut-over).
+-- The v1 per-partner shared copies (scope 'shared:<relation>') are no longer
+-- written by any code path: Our Story lives only in story_chapters /
+-- shared_memories / shared_memory_members. Existing legacy rows stay as inert,
+-- migrated history (linked via migrated_to_shared_id by the backfill), so the
+-- guard only rejects NEW v1 shared rows (insert, or re-scoping a row into
+-- 'shared:%'); link/flag updates on existing legacy rows remain allowed.
+create or replace function public.sp_scrapbook_entries_v2_only() returns trigger
+language plpgsql set search_path = public as $$
+begin
+  if new.scope like 'shared:%' and (tg_op = 'INSERT' or old.scope is distinct from new.scope) then
+    raise exception 'SP_V1_SHARED_SCOPE: Scrapbook v1 shared copies are retired (scope %)', new.scope using errcode = 'SPV02';
+  end if;
+  return new;
+end $$;
+drop trigger if exists scrapbook_entries_v2_only_trg on public.scrapbook_entries;
+create trigger scrapbook_entries_v2_only_trg before insert or update of scope on public.scrapbook_entries
+  for each row execute function public.sp_scrapbook_entries_v2_only();
+revoke execute on function public.sp_scrapbook_entries_v2_only() from public, anon, authenticated;

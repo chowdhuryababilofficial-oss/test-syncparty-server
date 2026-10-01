@@ -83,7 +83,6 @@ async function main() {
     process.exit(2);
   }
   if (process.env.NODE_ENV === "production") { console.error("Refusing to run with NODE_ENV=production."); process.exit(2); }
-  process.env.SCRAPBOOK_SHARED_V2 = "1"; // this process and its workers only
   process.env.SP_DISABLE_SCRAPBOOK_MAINTENANCE = "1";
   const WORKERS = Math.max(2, Number(val("--workers")) || 4);
   const TRIALS = Math.max(1, Number(val("--trials")) || 6);

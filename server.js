@@ -9,7 +9,6 @@ const scrapbook = require("./scrapbook-store");
 // one instance at a time. Timers are unref'd so they never hold the process.
 let lastScrapbookMaintenanceAt = 0;
 function maybeRunScrapbookMaintenance(force = false) {
-  if (!scrapbook.v2Enabled || !scrapbook.v2Enabled()) return;
   if (!force && Date.now() - lastScrapbookMaintenanceAt < 3600000) return;
   lastScrapbookMaintenanceAt = Date.now();
   scrapbook.runMaintenance().catch(e => console.error('[SyncParty Scrapbook maintenance]', e?.message || e));
@@ -32,10 +31,6 @@ const navigationTransitions = new Map();
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
-// Scrapbook v2 kill switch: v2-only routes answer this when SCRAPBOOK_SHARED_V2
-// is off, before any storage access (503 = retryable, so a client caught by an
-// ON -> OFF flip keeps its sitting envelope in its v2 backup, never in v1).
-function v2DisabledResponse(res) { const d=scrapbook.v2Disabled(); json(res,d.status,{ok:false,error:d.error,code:d.code,sharedV2:false}); }
 function json(res, status, body, extra={}) {
   res.writeHead(status, { "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"Content-Type, Authorization", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", ...extra });
   res.end(JSON.stringify(body));
@@ -159,18 +154,14 @@ const httpServer = http.createServer(async (req, res) => {
       const includeArchived=u.searchParams.get("includeArchived")!=="0";
       maybeRunScrapbookMaintenance();
       const relations=await scrapbook.listUserRelations(user.id);
-      if(scrapbook.v2Enabled()){
-        const flag=k=>u.searchParams.get(k)==="1";
-        if(scope==='shared'){
-          const r=await scrapbook.listSharedV2(user.id,{chapterId:u.searchParams.get("chapterId")||null,relationId,includeHidden:flag("includeHidden"),includeRemoved:flag("includeRemoved")});
-          json(res,200,{ok:true,scope,entries:r.entries.slice(0,limit),relations,chapter:r.chapter,chapters:r.chapters}); return;
-        }
-        const entries=await scrapbook.listPersonalV2(user.id,{limit,includeArchived,includeRemoved:flag("includeRemoved")});
-        json(res,200,{ok:true,scope,entries,relations}); return;
+      // Scrapbook V2 is the only storage model: Our Story = one shared memory
+      // per chapter journey, My Scrapbook = the caller's personal V2 rows.
+      const flag=k=>u.searchParams.get(k)==="1";
+      if(scope==='shared'){
+        const r=await scrapbook.listSharedV2(user.id,{chapterId:u.searchParams.get("chapterId")||null,relationId,includeHidden:flag("includeHidden"),includeRemoved:flag("includeRemoved")});
+        json(res,200,{ok:true,scope,entries:r.entries.slice(0,limit),relations,chapter:r.chapter,chapters:r.chapters}); return;
       }
-      const entries=scope==='shared'
-        ? await scrapbook.listSharedEntries(user.id,relationId,limit,includeArchived)
-        : await scrapbook.listPersonalEntries(user.id,limit,includeArchived);
+      const entries=await scrapbook.listPersonalV2(user.id,{limit,includeArchived,includeRemoved:flag("includeRemoved")});
       json(res,200,{ok:true,scope,entries,relations}); return;
     }
 
@@ -188,11 +179,10 @@ const httpServer = http.createServer(async (req, res) => {
         const ids=[relation.user1_id,relation.user2_id];
         if(!ids.includes(user.id)){json(res,403,{ok:false,error:"You are not part of this Shared Scrapbook."});return;}
       }
-      // v2: one shared memory per chapter - an old client's shared save only
-      // ever updates the CALLER's member totals (never a copy per partner).
-      const targets=b.scope==='shared'?(scrapbook.v2Enabled()?[user.id]:[relation.user1_id,relation.user2_id]):[user.id];
-      const created=[];
-      for(const uid of targets){created.push(await scrapbook.upsertEntry(uid,b.entry,b.scope==='shared'?relation.id:null));}
+      // One shared memory per chapter journey: a direct shared save (manual
+      // /keep, older clients) only ever updates the CALLER's member totals in
+      // V2 storage - never a copy per partner, never a personal duplicate.
+      const created=[await scrapbook.upsertEntry(user.id,b.entry,b.scope==='shared'?relation.id:null)];
       json(res,200,{ok:true,entries:created}); return;
     }
 
@@ -209,8 +199,6 @@ const httpServer = http.createServer(async (req, res) => {
         try{
           // Backed-up sitting saves keep their server-decided destination.
           if(e&&e.sitting&&typeof e.sitting==='object'){
-            // v2 OFF: refused, never re-routed into a v1 personal save.
-            if(!scrapbook.v2Enabled()){failed.push({sourceKey:key,error:scrapbook.v2Disabled().error,code:'SCRAPBOOK_V2_DISABLED'});continue;}
             const r=await scrapbook.saveSitting(user.id,{...e.sitting,entry:e});
             if(r.ok){out.push({sourceKey:key,sitting:r});continue;}
             failed.push({sourceKey:key,error:r.error||'Could not store entry.'});continue;
@@ -313,7 +301,6 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path.startsWith("/api/scrapbook/sittings/") && req.method === "POST") {
-      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const kind=path.slice("/api/scrapbook/sittings/".length);
       const r=kind==="intent"?await scrapbook.recordIntent(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null,playing:!!b.playing})
@@ -324,33 +311,29 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     if (path === "/api/scrapbook/journeys/action" && req.method === "POST") {
-      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const r=await scrapbook.journeyAction(user.id,b);
       if(r.error){json(res,r.status||400,{ok:false,error:r.error,readOnly:!!r.readOnly,blockedUntil:r.blockedUntil||null});return;}
       json(res,200,{ok:true,...r}); return;
     }
 
-    // Lets the extension pick the v2 sitting save path only when the server
-    // has it enabled (SCRAPBOOK_SHARED_V2=1). Public, no user data.
+    // Compatibility handshake for already-installed extensions: V2 is the only
+    // Scrapbook architecture, so this always answers sharedV2:true.
     if (path === "/api/scrapbook/capabilities" && req.method === "GET") {
-      json(res,200,{ok:true,sharedV2:scrapbook.v2Enabled()}); return;
+      json(res,200,{ok:true,sharedV2:true}); return;
     }
 
     if (path === "/api/scrapbook/chapters" && req.method === "GET") {
-      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,chapters:await scrapbook.chaptersForUser(user.id)}); return;
     }
 
     if (path === "/api/scrapbook/moments" && req.method === "GET") {
-      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,moments:await scrapbook.buildMoments(user.id)}); return;
     }
 
     if (path === "/api/scrapbook/moments/seen" && req.method === "POST") {
-      if(!scrapbook.v2Enabled()){v2DisabledResponse(res);return;}
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       json(res,200,await scrapbook.markMomentsSeen(user.id,b.momentIds)); return;
     }
