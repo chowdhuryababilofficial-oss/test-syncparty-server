@@ -1,6 +1,6 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
-const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity } = require("./auth-store");
+const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity, getAccountPreferences, setQuickReactions, markNotificationsRead } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
 
 // Scrapbook maintenance (purge of removed memories past their 30-day restore
@@ -126,6 +126,24 @@ const httpServer = http.createServer(async (req, res) => {
       if(!b.claimOnly && !String(identity.partyName||"").trim()){json(res,400,{ok:false,error:"Party Name is required."});return;}
       const updated=await setPartyIdentity(user.id,identity,{claimOnly:!!b.claimOnly});
       json(res,200,{ok:true,user:publicUser(updated||user)}); return;
+    }
+
+    // Account preferences (owner-only): quick-reaction tray + Activity read
+    // state. One GET loads both; each write is a single small request.
+    if (path === "/api/account/preferences" && req.method === "GET") {
+      const user=await requireUser(req,res); if(!user)return;
+      json(res,200,{ok:true,...(await getAccountPreferences(user.id))}); return;
+    }
+    if (path === "/api/account/quick-reactions" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      if(!Array.isArray(b.quickReactions)){json(res,400,{ok:false,error:"quickReactions must be a list."});return;}
+      const saved=await setQuickReactions(user.id,b.quickReactions);
+      if(!saved){json(res,404,{ok:false,error:"Account not found."});return;}
+      json(res,200,{ok:true,...saved}); return;
+    }
+    if (path === "/api/account/notifications/read" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      json(res,200,{ok:true,...(await markNotificationsRead(user.id,b.ids))}); return;
     }
 
     if (path === "/api/scrapbook/resolver-check" && req.method === "GET") {

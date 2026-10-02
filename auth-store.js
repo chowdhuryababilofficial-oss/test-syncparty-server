@@ -273,6 +273,107 @@ async function revokeSession(bearer) {
   if (error) throw error;
 }
 
+// ---------------------------------------------------------------------------
+// Account preferences (owner-only; never part of publicUser, so peers and
+// Our Story partners never see them).
+//   * quick reactions: users.quick_reactions (jsonb array, max 6 ids) +
+//     users.quick_reactions_updated_at (server clock). The latest write wins;
+//     clients send each change as it happens.
+//   * Activity read state: notification_reads, one row per (user, notification
+//     id) — primary key makes repeats a no-op, only the newest 400 are kept.
+// ---------------------------------------------------------------------------
+const QUICK_REACTIONS_MAX = 6;
+const NOTIF_READS_KEEP = 400;
+const NOTIF_IDS_PER_WRITE = 100;
+
+function sanitizeQuickReactions(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const v of list) {
+    const id = String(v || "").trim();
+    if (/^[a-z0-9][a-z0-9-]{0,47}$/.test(id) && !out.includes(id)) out.push(id);
+    if (out.length >= QUICK_REACTIONS_MAX) break;
+  }
+  return out;
+}
+function sanitizeNotificationIds(list) {
+  if (!Array.isArray(list)) return [];
+  const out = new Set();
+  for (const v of list) {
+    const id = String(v ?? "").trim();
+    if (id && id.length <= 200) out.add(id);
+    if (out.size >= NOTIF_IDS_PER_WRITE) break;
+  }
+  return [...out];
+}
+
+async function getAccountPreferences(userId) {
+  const sb = getSupabaseAdmin();
+  const uid = String(userId);
+  const [u, r] = await Promise.all([
+    sb.from("users").select("quick_reactions,quick_reactions_updated_at").eq("id", uid).maybeSingle(),
+    sb.from("notification_reads").select("notif_id,read_at").eq("user_id", uid).order("read_at", { ascending: false }).limit(NOTIF_READS_KEEP)
+  ]);
+  if (u.error) throw u.error;
+  if (r.error) throw r.error;
+  const row = u.data || {};
+  return {
+    quickReactions: Array.isArray(row.quick_reactions) ? sanitizeQuickReactions(row.quick_reactions) : null,
+    quickReactionsUpdatedAt: Number(row.quick_reactions_updated_at) || 0,
+    notificationReadIds: (r.data || []).map(x => String(x.notif_id))
+  };
+}
+
+// One UPDATE; the server stamps the time so device clocks never matter.
+async function setQuickReactions(userId, list) {
+  const ids = sanitizeQuickReactions(list);
+  if (!ids) return null;
+  const sb = getSupabaseAdmin();
+  const at = now();
+  const { data, error } = await sb.from("users")
+    .update({ quick_reactions: ids, quick_reactions_updated_at: at })
+    .eq("id", String(userId)).select("id").maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  return { quickReactions: ids, quickReactionsUpdatedAt: at };
+}
+
+// Inserts only ids not stored yet (no duplicate rows, nothing rewritten).
+async function markNotificationsRead(userId, list) {
+  const ids = sanitizeNotificationIds(list);
+  if (!ids.length) return { added: 0 };
+  const sb = getSupabaseAdmin();
+  const uid = String(userId);
+  const have = await sb.from("notification_reads").select("notif_id").eq("user_id", uid).in("notif_id", ids);
+  if (have.error) throw have.error;
+  const known = new Set((have.data || []).map(x => String(x.notif_id)));
+  const fresh = ids.filter(id => !known.has(id));
+  if (!fresh.length) return { added: 0 };
+  const at = now();
+  const rows = fresh.map(id => ({ user_id: uid, notif_id: id, read_at: at }));
+  let added = 0;
+  const batch = await sb.from("notification_reads").insert(rows);
+  if (!batch.error) added = rows.length;
+  else if (batch.error.code === "23505") {
+    // Another device stored some of them at the same moment: keep the rest.
+    for (const row of rows) {
+      const one = await sb.from("notification_reads").insert(row);
+      if (!one.error) added++;
+      else if (one.error.code !== "23505") throw one.error;
+    }
+  } else throw batch.error;
+  await pruneNotificationReads(uid);
+  return { added };
+}
+async function pruneNotificationReads(uid) {
+  const sb = getSupabaseAdmin();
+  const { data, error } = await sb.from("notification_reads").select("read_at").eq("user_id", uid)
+    .order("read_at", { ascending: false }).limit(NOTIF_READS_KEEP + 1);
+  if (error || !data || data.length <= NOTIF_READS_KEEP) return;
+  const cutoff = Number(data[NOTIF_READS_KEEP - 1].read_at);
+  await sb.from("notification_reads").delete().eq("user_id", uid).lt("read_at", cutoff);
+}
+
 module.exports = {
   normalizeEmail,
   createEmailUser,
@@ -286,6 +387,10 @@ module.exports = {
   revokeSession,
   publicUser,
   setPartyIdentity,
+  getAccountPreferences,
+  setQuickReactions,
+  markNotificationsRead,
+  sanitizeQuickReactions,
   normalizePartyIdentity,
   id,
   token,

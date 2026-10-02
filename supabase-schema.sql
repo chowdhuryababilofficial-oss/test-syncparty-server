@@ -1031,3 +1031,30 @@ drop trigger if exists scrapbook_entries_v2_only_trg on public.scrapbook_entries
 create trigger scrapbook_entries_v2_only_trg before insert or update of scope on public.scrapbook_entries
   for each row execute function public.sp_scrapbook_entries_v2_only();
 revoke execute on function public.sp_scrapbook_entries_v2_only() from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 9.10 Account preferences (quick-reaction tray + Activity read state)
+-- ---------------------------------------------------------------------------
+-- Quick reactions live on the account row (one small array per user, latest
+-- write wins, server-stamped). Activity "seen" state is one row per
+-- (user, notification id): the primary key makes repeats a no-op and its
+-- user_id prefix serves every query (per-user lists are capped at 400 rows).
+alter table public.users add column if not exists quick_reactions jsonb;
+alter table public.users add column if not exists quick_reactions_updated_at bigint;
+alter table public.users drop constraint if exists users_quick_reactions_shape;
+alter table public.users add constraint users_quick_reactions_shape
+  check (quick_reactions is null or (jsonb_typeof(quick_reactions) = 'array' and jsonb_array_length(quick_reactions) <= 6));
+
+create table if not exists public.notification_reads (
+  user_id text not null references public.users(id) on delete cascade,
+  notif_id text not null check (char_length(notif_id) between 1 and 200),
+  read_at bigint not null,
+  primary key (user_id, notif_id)
+);
+alter table public.notification_reads enable row level security;
+
+-- Advisor fixes: listUserRelations filters on user2_id (user1_id is covered
+-- by relations_pair_uidx); the partial lookup index duplicated that unique
+-- index and was never used.
+create index if not exists relations_user2_idx on public.relations (user2_id);
+drop index if exists public.relations_active_lookup_idx;
