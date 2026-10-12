@@ -28,6 +28,9 @@ const roomTargets = new Map();
 const clients = new Map();
 const clientSockets = new Map();
 const navigationTransitions = new Map();
+// One ordered timeline on the existing playback channel.
+const roomPlayback = new Map();
+let presenceSerial = 0;
 const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
@@ -443,23 +446,32 @@ function clearPendingDeparture(room, id) {
   pendingDepartures.delete(key);
   return true;
 }
-function announceLeft(room, id, name) {
+function presenceNotice(room, id, name, event, skip = null) {
+  const label = event === "joined" ? "Joined" : event === "left" ? "Left the room" : "Disconnected";
+  broadcast(room, { type: "message", payload: { kind: "system", presenceEvent: event, id,
+    eventId: `presence_${Date.now()}_${++presenceSerial}`, text: `${name} ${label}`, t: Date.now() } }, skip);
+}
+function announceLeft(room, id, name, event = "left") {
   if (!rooms.get(room)?.size) return;
-  broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "left", id, name, t: Date.now() } });
-  broadcast(room, { type: "message", payload: { kind: "system", presenceEvent: "left", id, text: `${name} left the party`, t: Date.now() } });
+  broadcast(room, { type: "message", payload: { kind: "peer-connection", state: event, id, name, t: Date.now() } });
+  presenceNotice(room, id, name, event);
 }
 function startDeparture(room, id, s) {
   const key = `${room}|${id}`;
-  clearPendingDeparture(room, id);
+  if (pendingDepartures.has(key)) return;
   const record = { ...transitionPeerRecord(s), reconnecting: true };
   const timer = setTimeout(() => {
     if (pendingDepartures.get(key)?.timer !== timer) return;
     pendingDepartures.delete(key);
+    rememberMember(room,id);
+    releasePlaybackHold(room,id);
     broadcastPeers(room);
-    announceLeft(room, id, record.name);
+    announceLeft(room, id, record.name,"disconnected");
+    cleanupTransitionParticipant(room,id);
   }, PRESENCE_GRACE_MS);
   if (timer.unref) timer.unref();
   pendingDepartures.set(key, { timer, record, room, id });
+  holdPlayback(room,id,"connection",record.name);
   broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "reconnecting", id, name: record.name, t: Date.now() } });
 }
 function clearRoomDepartures(room, remember) {
@@ -488,6 +500,129 @@ function broadcastPeers(room) {
   const peers = [...byId.values()];
   broadcast(room, { type: "peers", peers, count: peers.length });
 }
+// Commands advance revision; snapshots advance sequence. A follower's
+// heartbeat cannot take over the timeline or undo a play/pause/seek intent.
+function playbackClock() { return Number(process.hrtime.bigint())/1000000; }
+function playbackFor(room, enable = false) {
+  let x = roomPlayback.get(room);
+  if (!x && enable) {
+    x = { epoch:`room_${Date.now()}_${randId()}`, revision:0, sequence:0,
+      time:0, at:playbackClock(), rate:1, playing:false, initialized:false,
+      controller:null, controllerAt:0, holds:new Map(), idleTimer:null };
+    roomPlayback.set(room,x);
+  }
+  return x;
+}
+function playbackPosition(x) {
+  return x.time + (x.playing ? Math.max(0,playbackClock()-x.at)/1000*x.rate : 0);
+}
+function playbackPacket(room,event="heartbeat") {
+  const x=playbackFor(room); if(!x)return null;
+  return { kind:"sync",event,authoritative:true,roomEpoch:x.epoch,
+    revision:x.revision,sequence:++x.sequence,controllerId:x.controller,
+    ...(x.initialized ? {time:playbackPosition(x)} : {}),playing:x.playing,
+    rate:x.rate,sentAt:Date.now(),serverSentAt:Date.now(),pageKey:"",
+    holds:[...x.holds].map(([id,h])=>({id,name:h.name,reasons:[...h.reasons]})) };
+}
+function publishPlayback(room,event="heartbeat",ws=null,observer=null) {
+  const payload=playbackPacket(room,event); if(!payload)return;
+  payload.id=observer?.clientId || "__relay__";
+  if(observer)payload.observerPlaying=payload.playing;
+  if(ws)send(ws,{type:"message",payload}); else broadcast(room,{type:"message",payload});
+}
+function freezePlayback(x) {
+  x.time=playbackPosition(x); x.at=playbackClock(); x.playing=false;
+}
+function holdPlayback(room,id,reason,name) {
+  const x=playbackFor(room); if(!x)return;
+  let h=x.holds.get(id); if(h?.reasons.has(reason))return;
+  const wasPlaying=x.playing; freezePlayback(x);
+  if(!h){h={name:name||"A viewer",reasons:new Set()};x.holds.set(id,h);}
+  h.reasons.add(reason); x.revision++; publishPlayback(room,"hold");
+  if(reason!=="connection")broadcast(room,{type:"message",payload:{kind:"system",
+    text:`${h.name} ${reason==="suspended"?"is suspended":reason==="autoplay"?"needs to allow playback":reason==="loading"?"is loading the player":"is buffering"}${wasPlaying?" — playback paused for everyone.":". Waiting for recovery."}`}});
+}
+function releasePlaybackHold(room,id,reason=null) {
+  const x=playbackFor(room),h=x?.holds.get(id); if(!h)return;
+  if(reason)h.reasons.delete(reason);else h.reasons.clear();
+  if(h.reasons.size)return;
+  x.holds.delete(id);x.revision++;x.at=playbackClock();
+  // Recovery never auto-resumes. One fresh play intent after all blockers
+  // clear is safer than autoplay/pause oscillation across different engines.
+  publishPlayback(room,"recovery");
+  if(!x.holds.size)broadcast(room,{type:"message",payload:{kind:"system",
+    text:"Everyone remaining is ready — press Play to resume together."}});
+  // Readiness may have arrived before the final health-clear packet. Recheck
+  // the existing navigation barrier so that ordering cannot strand the room.
+  maybeReleaseTransition(room);
+}
+function handlePlaybackMessage(ws,s,p) {
+  const x=playbackFor(s.room); if(!x)return false;
+  if(p.kind==="buffering"){
+    const healthSeq=Number(p.healthSeq);
+    if(Number.isFinite(healthSeq)){
+      if(healthSeq<=(s.lastHealthSeq||0))return true;
+      s.lastHealthSeq=healthSeq;
+    }
+    const reason=["suspended","autoplay"].includes(p.reason)?p.reason:"buffering";
+    if(p.active!==false)holdPlayback(s.room,s.clientId,reason,s.profile?.name);
+    else releasePlaybackHold(s.room,s.clientId);
+    return true;
+  }
+  if(p.kind!=="sync")return false;
+  const seq=Number(p.syncSeq);
+  if(Number.isFinite(seq)){if(seq<=(s.lastSyncSeq||0))return true;s.lastSyncSeq=seq;}
+  if(p.roomEpoch&&p.roomEpoch!==x.epoch){publishPlayback(s.room,"resync",ws);return true;}
+  const event=String(p.event||"heartbeat");
+  if(!["heartbeat","resync","play","pause","seeking","seeked","ratechange"].includes(event))return true;
+  const transition=activeTransition(s.room);
+  if(transition&&!transition.released)return true;
+  if(Number(p.sampleAgeMs)>2500){publishPlayback(s.room,"resync",ws);return true;}
+  if(event==="resync"){publishPlayback(s.room,"resync",ws);return true;}
+  const continuation=event!=="heartbeat" && s.lastIntentRevision===x.revision &&
+    Number(p.baseRevision)===s.lastIntentBase && x.controller===s.clientId;
+  if(Number.isFinite(Number(p.baseRevision))&&Number(p.baseRevision)<x.revision&&!continuation){
+    publishPlayback(s.room,"resync",ws);return true;
+  }
+  if(!x.initialized&&Number.isFinite(p.time)&&p.time>=0){
+    x.time=p.time;x.at=playbackClock();x.initialized=true;x.controller=s.clientId;x.controllerAt=playbackClock();
+    if (transition?.released && !x.holds.size) x.playing=p.playing===true;
+  }
+  if(event==="heartbeat"){
+    if(!x.controller||playbackClock()-x.controllerAt>12000)x.controller=s.clientId;
+    if(x.holds.size)return true;
+    if(s.clientId!==x.controller){
+      if(p.playing===x.playing)publishPlayback(s.room,"heartbeat",null,s);
+      return true;
+    }
+    x.controllerAt=playbackClock();
+    if(p.playing!==x.playing)return true;
+    const sample=Number(p.time);
+    if(Number.isFinite(sample)&&Math.abs(sample-playbackPosition(x))<=1.25){
+      x.time=Math.max(0,sample);x.at=playbackClock();
+    }
+    publishPlayback(s.room,"heartbeat",null,s);return true;
+  }
+  if(x.holds.size&&event!=="pause"){publishPlayback(s.room,"hold",ws);return true;}
+  x.time=playbackPosition(x);x.at=playbackClock();
+  if((event==="seeking"||event==="seeked")&&Number.isFinite(p.time)&&p.time>=0)x.time=p.time;
+  if(event==="play")x.playing=true;
+  if(event==="pause")x.playing=false;
+  if(event==="ratechange"&&Number.isFinite(p.rate)&&p.rate>=0.25&&p.rate<=4)x.rate=p.rate;
+  x.controller=s.clientId;x.controllerAt=playbackClock();
+  s.lastIntentBase=Number.isFinite(Number(p.baseRevision))?Number(p.baseRevision):x.revision;
+  x.revision++;s.lastIntentRevision=x.revision;
+  publishPlayback(s.room,event,null,s);return true;
+}
+function retainEmptyRoom(room) {
+  const x=playbackFor(room);if(x?.idleTimer)clearTimeout(x.idleTimer);
+  const timer=setTimeout(()=>{
+    if(rooms.get(room)?.size)return;
+    clearRoomDepartures(room,false);
+    rooms.delete(room);roomTargets.delete(room);navigationTransitions.delete(room);roomPlayback.delete(room);
+  },RECENT_MEMBER_MS);
+  timer.unref?.();if(x)x.idleTimer=timer;
+}
 function sendTransitionState(ws, t) {
   if (!t) return;
   send(ws, {
@@ -498,6 +633,7 @@ function sendTransitionState(ws, t) {
     title: t.title,
     reason: t.reason,
     releaseAt: t.releaseAt || null,
+    releaseDelayMs: t.releaseAt ? Math.max(0,t.releaseAt-Date.now()) : null,
     requiredCount: t.required.size,
     readyCount: t.ready.size
   });
@@ -521,16 +657,28 @@ function cleanupTransitionParticipant(room, clientId) {
 function maybeReleaseTransition(room) {
   const t = activeTransition(room);
   if (!t || t.released || !t.required.size) return;
+  if (playbackFor(room)?.holds.size) return;
   for (const id of t.required) if (!t.ready.has(id)) return;
   t.released = true;
   t.releaseAt = Date.now() + 900;
+  const playback=playbackFor(room);
+  if(playback){
+    playback.time=0;playback.at=playbackClock()+900;playback.initialized=true;
+    playback.rate=1;playback.playing=true;playback.holds.clear();playback.revision++;
+  }
   broadcast(room, { type: "message", payload: {
     kind: "transition-release",
     transitionId: t.id,
     url: t.url,
     releaseAt: t.releaseAt,
+    releaseDelayMs: 900,
     time: 0
   }});
+  const releaseRevision=playback?.revision;
+  setTimeout(()=>{
+    if(activeTransition(room)===t && t.released && playback?.playing &&
+       !playback.holds.size && playback.revision===releaseRevision)publishPlayback(room,"play");
+  },900).unref?.();
   setTimeout(() => {
     const current = activeTransition(room);
     if (current === t) navigationTransitions.delete(room);
@@ -569,6 +717,11 @@ function startNavigationTransition(room, initiator, p) {
     }
   }
   t.required.forEach(id => t.ready.delete(id));
+  const playback=playbackFor(room);
+  if(playback){
+    freezePlayback(playback);playback.time=0;playback.initialized=false;
+    playback.holds.clear();playback.revision++;
+  }
   navigationTransitions.set(room, t);
   roomTargets.set(room, url);
   const transitionPayload = {
@@ -590,10 +743,18 @@ function detachSocket(ws, announce = true, removeClient = true, explicit = false
   const name = s.profile?.name || "Someone";
   const t = activeTransition(room);
   const stableId = s.clientId || s.id;
-  const gracefulNavigation = !!(t && t.required.has(stableId));
+  const gracefulNavigation = !!(t && t.required.has(stableId) && !explicit);
   if (room && rooms.has(room)) {
     rooms.get(room).delete(ws);
-    if (rooms.get(room).size) {
+    if (explicit) {
+      clearPendingDeparture(room,stableId);
+      forgetMember(room,stableId);
+      releasePlaybackHold(room,stableId);
+      cleanupTransitionParticipant(room,stableId);
+      broadcastPeers(room);
+      announceLeft(room,stableId,name);
+      if (!rooms.get(room)?.size) retainEmptyRoom(room);
+    } else if (rooms.get(room).size) {
       if (announce && !gracefulNavigation) {
         if (explicit) {
           clearPendingDeparture(room, stableId);
@@ -614,11 +775,8 @@ function detachSocket(ws, announce = true, removeClient = true, explicit = false
     } else {
       // Last socket gone. If it was a drop (relay restart / everyone's network)
       // remember the members so their rejoin is not announced as a new arrival.
-      clearRoomDepartures(room, true);
-      if (explicit) forgetMember(room, stableId); else rememberMember(room, stableId);
-      rooms.delete(room);
-      roomTargets.delete(room);
-      navigationTransitions.delete(room);
+      if (announce) startDeparture(room,stableId,s);
+      retainEmptyRoom(room);
     }
   }
   if (s.clientId && clientSockets.get(s.clientId) === ws) clientSockets.delete(s.clientId);
@@ -645,20 +803,22 @@ wss.on("connection", ws => {
       const room = norm(m.room); if (room.length !== 6) return;
       const clientId = String(m.clientId || "").trim().slice(0, 128);
       let replacedLiveSocket = false;
+      const repeatedJoin = s.room === room;
+      const navKnown = !!activeTransition(room)?.participants.has(clientId);
 
       // Replace any older live socket belonging to the same browser tab.
       if (clientId) {
         const old = clientSockets.get(clientId);
         if (old && old !== ws) {
           // Same tab, newer socket (reload / network handover): continuity, not a new arrival.
-          replacedLiveSocket = true;
-          detachSocket(old, false);
+          replacedLiveSocket = clients.get(old)?.room === room;
+          detachSocket(old,!replacedLiveSocket,true,!replacedLiveSocket);
           try { old.close(4001, "replaced by newer tab connection"); } catch {}
         }
       }
 
       // A single socket cannot belong to multiple rooms.
-      if (s.room) detachSocket(ws, true, false);
+      if (s.room && !repeatedJoin) detachSocket(ws,true,false,true);
 
       s.room = room;
       s.clientId = clientId || s.clientId || s.id;
@@ -666,6 +826,20 @@ wss.on("connection", ws => {
       s.pageKey = String(m.pageKey || "");
       s.pageUrl = normalizeUrl(m.pageUrl);
       s.profile = sanitizeProfile(m.profile);
+      s.syncProtocol = Number(m.syncProtocol) || 1;
+      const playback = playbackFor(room,s.syncProtocol >= 2);
+      if (playback) {
+        if (playback.idleTimer) { clearTimeout(playback.idleTimer); playback.idleTimer = null; }
+        if (!playback.initialized && !activeTransition(room) && Number.isFinite(m.playback?.time) && m.playback.time >= 0) {
+          playback.time = m.playback.time;
+          playback.rate = Math.min(4,Math.max(0.25,Number(m.playback.rate)||1));
+          playback.at = playbackClock();
+          playback.playing = !m.resume && m.playback.playing === true;
+          playback.initialized = true;
+          playback.controller = s.clientId;
+          playback.controllerAt = playbackClock();
+        }
+      }
       clientSockets.set(s.clientId, ws);
 
       const existingTransition = activeTransition(room);
@@ -675,7 +849,7 @@ wss.on("connection", ws => {
       if (!roomTargets.has(room) && s.pageUrl) roomTargets.set(room, s.pageUrl);
       set.add(ws);
 
-      if (existingTransition) {
+      if (existingTransition && !repeatedJoin) {
         // A reconnecting tab must prove readiness again on its newly loaded page;
         // otherwise the old page's ready bit could release the barrier early.
         existingTransition.required.add(s.clientId);
@@ -684,15 +858,20 @@ wss.on("connection", ws => {
       }
 
       send(ws, { type: "you", id: s.id, clientId: s.clientId });
-      send(ws, { type: "room-info", room, targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
+      send(ws, { type: "room-info", room, syncProtocol:playback?2:1, playback:playbackPacket(room,"resync"), targetUrl: roomTargets.get(room) || null, transition: existingTransition ? { active:true, transitionId:existingTransition.id, url:existingTransition.url, title:existingTransition.title, reason:existingTransition.reason, releaseAt:existingTransition.releaseAt || null, requiredCount:existingTransition.required.size, readyCount:existingTransition.ready.size } : null });
       if (existingTransition) sendTransitionState(ws, existingTransition);
       const returning = clearPendingDeparture(room, s.clientId);
-      const knownMember = returning || replacedLiveSocket || wasRecentMember(room, s.clientId);
+      const knownMember = returning || replacedLiveSocket || repeatedJoin || navKnown || wasRecentMember(room,s.clientId) || m.resume === true;
       broadcastPeers(room);
-      if (returning) broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "back", id: s.clientId, name: s.profile.name, t: Date.now() } }, ws);
+      if (returning || (knownMember && !repeatedJoin)) broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "back", id: s.clientId, name: s.profile.name, t: Date.now() } }, ws);
       // During an active navigation handoff, presence is continuous: do not emit
       // a generic joined-party chat line for a reconnecting/newly arrived socket.
-      if (!existingTransition && !wasEmpty && !knownMember) broadcast(room, { type: "message", payload: { kind: "system", presenceEvent: "joined", id: s.clientId, text: `${s.profile.name} joined the party`, t: Date.now() } }, ws);
+      if (!wasEmpty && !knownMember) presenceNotice(room,s.clientId,s.profile.name,"joined",ws);
+      if (playback && s.syncProtocol>=2 && !repeatedJoin && !existingTransition && m.playback?.ready !== true) {
+        holdPlayback(room,s.clientId,"loading",s.profile.name);
+      }
+      if (playback && s.syncProtocol<2 && knownMember) releasePlaybackHold(room,s.clientId);
+      if (playback && !repeatedJoin) publishPlayback(room,"resync",ws);
       return;
     }
 
@@ -706,6 +885,7 @@ wss.on("connection", ws => {
         "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
+      if ((kind === "sync" || kind === "buffering") && handlePlaybackMessage(ws,s,p)) return;
 
       if (kind === "navigate") {
         const target = normalizeUrl(p.url);
@@ -722,6 +902,10 @@ wss.on("connection", ws => {
         const t = activeTransition(s.room);
         if (!t || !t.required.has(s.clientId)) return;
         if (p.transitionId && String(p.transitionId) !== String(t.id)) return;
+        if (playbackFor(s.room)?.holds.get(s.clientId)?.reasons.has("autoplay")) {
+          t.released=false;
+          releasePlaybackHold(s.room,s.clientId,"autoplay");
+        }
         t.ready.add(s.clientId);
         const liveProfile = sanitizeProfile(p);
         t.participants.set(s.clientId, liveProfile);
@@ -737,6 +921,7 @@ wss.on("connection", ws => {
         type: "message",
         payload: {
           ...p,
+          ...(kind === "system" ? {presenceEvent:undefined,eventId:undefined} : {}),
           transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
           url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
           id: p.id || s.id,
