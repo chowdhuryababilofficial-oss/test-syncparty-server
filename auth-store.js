@@ -338,40 +338,16 @@ async function setQuickReactions(userId, list) {
   return { quickReactions: ids, quickReactionsUpdatedAt: at };
 }
 
-// Inserts only ids not stored yet (no duplicate rows, nothing rewritten).
+// One database transaction: idempotent insert + exact 400-row retention,
+// serialized per user across all relay instances (including timestamp ties).
 async function markNotificationsRead(userId, list) {
   const ids = sanitizeNotificationIds(list);
   if (!ids.length) return { added: 0 };
-  const sb = getSupabaseAdmin();
-  const uid = String(userId);
-  const have = await sb.from("notification_reads").select("notif_id").eq("user_id", uid).in("notif_id", ids);
-  if (have.error) throw have.error;
-  const known = new Set((have.data || []).map(x => String(x.notif_id)));
-  const fresh = ids.filter(id => !known.has(id));
-  if (!fresh.length) return { added: 0 };
-  const at = now();
-  const rows = fresh.map(id => ({ user_id: uid, notif_id: id, read_at: at }));
-  let added = 0;
-  const batch = await sb.from("notification_reads").insert(rows);
-  if (!batch.error) added = rows.length;
-  else if (batch.error.code === "23505") {
-    // Another device stored some of them at the same moment: keep the rest.
-    for (const row of rows) {
-      const one = await sb.from("notification_reads").insert(row);
-      if (!one.error) added++;
-      else if (one.error.code !== "23505") throw one.error;
-    }
-  } else throw batch.error;
-  await pruneNotificationReads(uid);
-  return { added };
-}
-async function pruneNotificationReads(uid) {
-  const sb = getSupabaseAdmin();
-  const { data, error } = await sb.from("notification_reads").select("read_at").eq("user_id", uid)
-    .order("read_at", { ascending: false }).limit(NOTIF_READS_KEEP + 1);
-  if (error || !data || data.length <= NOTIF_READS_KEEP) return;
-  const cutoff = Number(data[NOTIF_READS_KEEP - 1].read_at);
-  await sb.from("notification_reads").delete().eq("user_id", uid).lt("read_at", cutoff);
+  const { data, error } = await getSupabaseAdmin().rpc("sp_account_notifications_read", {
+    p_user_id: String(userId), p_ids: ids
+  });
+  if (error) throw error;
+  return { added: Number(data?.added) || 0 };
 }
 
 module.exports = {
