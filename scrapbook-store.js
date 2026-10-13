@@ -757,7 +757,12 @@ async function ensureChaptersUnlocked(rel) {
   }
   return list;
 }
-async function ensureChapters(rel) { return withLock(`rel:${rel.id}`, () => ensureChaptersUnlocked(rel)); }
+async function ensureChapters(rel) {
+  const existing=await listChapterRows(rel.id);
+  // Reading an existing chapter never needs a write lease. Legacy creation
+  // retains the same fenced lock and rechecks under that lock.
+  return existing.length?existing:withLock(`rel:${rel.id}`,()=>ensureChaptersUnlocked(rel));
+}
 
 // Called when a Story starts or restarts. prevRow is the relation as it was
 // BEFORE activation (null for a brand-new relation). Never touches a closed
@@ -1019,13 +1024,19 @@ async function decideSitting(userId, { sittingId, sourceKey, roomId = null }) {
     const mine = recent(await q(sbx().from("sitting_decisions").select("*").eq("user_id", String(userId)).eq("source_key", sourceKey))).filter(r => r.sitting_id !== sittingId && inChapter(r));
     if (mine[0]) {
       const same = mine[0].destination === "SHARED" && mine[0].chapter_id === chapterId;
-      return { ok: true, decision: decisionView(await mk(same ? "SHARED" : "PERSONAL", "same_user_tab", same ? mine[0].co_sitting_id : null)) };
+      const ownIntent=same?await q(sbx().from("sitting_intents").select("*").eq("sitting_id",mine[0].sitting_id).maybeSingle()):null;
+      if(!same||roomId&&ownIntent?.room_id===String(roomId))
+        return { ok: true, decision: decisionView(await mk(same ? "SHARED" : "PERSONAL", "same_user_tab", same ? mine[0].co_sitting_id : null)) };
     }
     const partnerDecs = recent(await q(sbx().from("sitting_decisions").select("*").eq("user_id", String(ctx.partnerId)).eq("source_key", sourceKey))).filter(inChapter);
     const sharedP = partnerDecs.find(r => r.destination === "SHARED" && r.chapter_id === chapterId && r.co_sitting_id);
     if (sharedP) {
       const co = await q(sbx().from("co_sittings").select("*").eq("id", sharedP.co_sitting_id).maybeSingle());
-      if (co && t - Number(co.last_active_at || 0) < V2.SITTING_GAP_MS) return { ok: true, decision: decisionView(await mk("SHARED", "join_open_shared", co.id)) };
+      const partnerIntent=roomId?await q(sbx().from("sitting_intents").select("*").eq("sitting_id",sharedP.sitting_id).maybeSingle()):null;
+      if (co && t - Number(co.last_active_at || 0) < V2.SITTING_GAP_MS &&
+          partnerIntent?.playing && partnerIntent.room_id===String(roomId) &&
+          t-Number(partnerIntent.last_seen_at||0)<=V2.INTENT_FRESH_MS)
+        return { ok: true, decision: decisionView(await mk("SHARED", "join_open_shared", co.id)) };
     }
     if (partnerDecs.some(r => r.destination === "PERSONAL")) return { ok: true, decision: decisionView(await mk("PERSONAL", "partner_personal")) };
     if (roomId) {
@@ -1304,16 +1315,19 @@ function memoryToEntries(mems, viewerId, chapter, members = null, states = [], p
 
 async function listPersonalV2(userId, { limit = 300, includeArchived = true, includeRemoved = false, includeTwins = false } = {}) {
   const sb = sbx();
-  const base = (await q(sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", "personal"))) || [];
-  const later = (await q(sb.from("scrapbook_entries").select("*").eq("user_id", userId).like("scope", "personal:v%"))) || [];
-  const states = await journeyStateRows(personalSpace(userId));
+  const [base0,later0,states]=await Promise.all([
+    q(sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", "personal")),
+    q(sb.from("scrapbook_entries").select("*").eq("user_id", userId).like("scope", "personal:v%")),
+    journeyStateRows(personalSpace(userId))]);
+  const base=base0||[],later=later0||[];
+  const stateMap=new Map(states.map(s=>[JSON.stringify([s.journey_key,Number(s.generation)]),s]));
   const t = now();
   const out = [];
   for (const row of [...base, ...later]) {
     const e = rowToEntry(row);
     const jk = journeyKeyOf(e);
     const gen = scopeGeneration(row.scope) || 1;
-    const st = states.find(s => s.journey_key === jk && Number(s.generation) === gen);
+    const st = stateMap.get(JSON.stringify([jk,gen]));
     if (st && st.removed_at != null && (!includeRemoved || st.purged_at != null)) continue;
     if (row.twin_class === "pure_twin" && !includeTwins) continue;
     // Journey-scope archive wins; rows without journey state keep their
@@ -1331,8 +1345,8 @@ function pickChapter(chapters, { chapterId = null, relationId = null } = {}) {
   return pool.find(c => c.endedAt == null) || [...pool].sort((a, b) => b.chapterNo - a.chapterNo || b.startedAt - a.startedAt)[0] || null;
 }
 
-async function listSharedV2(userId, { chapterId = null, relationId = null, includeHidden = false, includeRemoved = false } = {}) {
-  const chapters = await chaptersForUser(userId);
+async function listSharedV2(userId, { chapterId = null, relationId = null, includeHidden = false, includeRemoved = false } = {}, loadedChapters = null) {
+  const chapters = loadedChapters || await chaptersForUser(userId);
   const picked = pickChapter(chapters, { chapterId, relationId });
   if (!picked) return { entries: [], chapter: null, chapters };
   // A pre-chapter (legacy) Story whose v1 shared copies were not backfilled
@@ -1340,11 +1354,13 @@ async function listSharedV2(userId, { chapterId = null, relationId = null, inclu
   // from shared memories (never from v1 rows).
   if (picked.legacy) await migrateLegacyRelation(picked.relationId);
   const chapter = await getChapterRow(picked.id);
-  const mems = (await q(sbx().from("shared_memories").select("*").eq("chapter_id", chapter.id))) || [];
-  const members = mems.length ? ((await q(sbx().from("shared_memory_members").select("*").in("memory_id", mems.map(m => m.id)))) || []) : [];
   const space = chapterSpace(chapter.id);
-  const states = await journeyStateRows(space);
-  const prefs = (await q(sbx().from("journey_member_prefs").select("*").eq("space", space).eq("user_id", String(userId)))) || [];
+  const [memRows,states,prefRows]=await Promise.all([
+    q(sbx().from("shared_memories").select("*").eq("chapter_id", chapter.id)),
+    journeyStateRows(space),
+    q(sbx().from("journey_member_prefs").select("*").eq("space", space).eq("user_id", String(userId)))]);
+  const mems=memRows||[],prefs=prefRows||[];
+  const members = mems.length ? ((await q(sbx().from("shared_memory_members").select("*").in("memory_id", mems.map(m => m.id)))) || []) : [];
   const t = now();
   let entries = memoryToEntries(mems, userId, chapter, members, states, prefs, t);
   entries = entries.filter(e => (includeHidden || !e.hidden) && (includeRemoved || !(e.journeyState && e.journeyState.removedAt != null)));
@@ -1667,11 +1683,10 @@ async function migrateLegacyRelation(relationId) {
 function ymd(ms) { return new Date(ms).toISOString().slice(0, 10); }
 async function buildMoments(userId, t = now()) {
   const moments = [];
-  const personal = await listPersonalV2(userId, { includeArchived: false });
+  const [personal,chapters] = await Promise.all([listPersonalV2(userId, { includeArchived: false }),chaptersForUser(userId)]);
   const spaces = [{ space: personalSpace(userId), label: "My Scrapbook", entries: personal }];
-  const chapters = await chaptersForUser(userId);
   for (const c of chapters) {
-    const r = await listSharedV2(userId, { chapterId: c.id });
+    const r = await listSharedV2(userId, { chapterId: c.id },chapters);
     spaces.push({ space: chapterSpace(c.id), label: "Our Story", chapter: c, entries: r.entries });
   }
   const DAY = 86400000;
@@ -1737,7 +1752,56 @@ async function markMomentsSeen(userId, ids) {
   return { ok: true, seen: list.length };
 }
 
+// Keyset-paged, account-authorized backlog discovery. This is separate from
+// initial page data so archived chapters and older-than-300 rows also heal.
+async function incompleteArtwork(userId,{personalAfter='',sharedAfter=''}={}){
+  const chapters=await chaptersForUser(userId);
+  let personal=sbx().from('scrapbook_entries').select('*').eq('user_id',String(userId)).like('scope','personal%').order('id').limit(50);
+  if(personalAfter)personal=personal.gt('id',String(personalAfter));
+  let shared=chapters.length?sbx().from('shared_memories').select('*').in('chapter_id',chapters.map(c=>c.id)).order('id').limit(50):null;
+  if(shared&&sharedAfter)shared=shared.gt('id',String(sharedAfter));
+  const [pr0,sh0]=await Promise.all([q(personal),shared?q(shared):[]]),pr=pr0||[],sh=sh0||[];
+  const rows=[...pr.map(rowToEntry),...sh.map(r=>rowToEntry({...r.entry,id:r.id,scope:'chapter:'+r.chapter_id}))];
+  const valid=v=>/^https?:\/\/[^/\s]+\/\S+/i.test(String(v||''));
+  const entries=rows.filter(e=>['movie','series','anime'].includes(e.contentType)&&(!valid(e.artwork)||!valid(e.backdrop)))
+    .map(e=>({id:e.id,scope:e.scope,contentType:e.contentType,artwork:e.artwork,backdrop:e.backdrop}));
+  const done=pr.length<50&&sh.length<50;
+  return {ok:true,entries,done,cursor:done?{personalAfter:'',sharedAfter:''}:
+    {personalAfter:pr.at(-1)?.id||personalAfter,sharedAfter:sh.at(-1)?.id||sharedAfter}};
+}
+// Conditional artwork-only patch: personal columns are CAS'd independently;
+// a shared entry JSON is CAS'd as a whole and retried after concurrent saves.
+// Never upsert a history record to repair artwork or overwrite watch totals.
+async function recoverArtwork(userId, {recordId,scope}={}) {
+  const shared=scope==='shared',table=shared?'shared_memories':'scrapbook_entries';
+  const valid=v=>/^https?:\/\/[^/\s]+\/\S+/i.test(String(v||''));
+  for(let attempt=0;attempt<3;attempt++){
+    let query=sbx().from(table).select('*').eq('id',String(recordId||''));
+    if(!shared)query=query.eq('user_id',String(userId));
+    const row=await q(query.maybeSingle());
+    if(!row)return {ok:false,status:404,error:'Memory not found.'};
+    if(shared&&!await userInChapter(userId,await getChapterRow(row.chapter_id)))return {ok:false,status:404,error:'Memory not found.'};
+    const entry=shared?rowToEntry({...row.entry,id:row.id,scope:'chapter:'+row.chapter_id}):rowToEntry(row);
+    if(valid(entry.artwork)&&valid(entry.backdrop))return {ok:true,complete:true};
+    const art=await require('./metadata-resolver').recoverArtwork(entry);
+    if(art.transient)return {ok:false,status:503,error:'Artwork provider temporarily unavailable.'};
+    const patch={};
+    for(const field of ['artwork','backdrop'])if(!valid(entry[field])&&valid(art[field]))patch[field]=art[field];
+    if(!Object.keys(patch).length)return {ok:true,complete:false};
+    let updated;
+    if(shared){
+      updated=await q(sbx().from(table).update({entry:{...row.entry,...patch}}).eq('id',row.id).eq('entry',JSON.stringify(row.entry)).select('id'));
+    }else{
+      let change=sbx().from(table).update(patch).eq('id',row.id).eq('user_id',String(userId));
+      for(const field of Object.keys(patch))change=row[field]==null?change.is(field,null):change.eq(field,row[field]);
+      updated=await q(change.select('id'));
+    }
+    if(updated?.length)return {ok:true,complete:valid(patch.artwork||entry.artwork)&&valid(patch.backdrop||entry.backdrop),recovered:true};
+  }
+  return {ok:false,status:409,error:'Memory changed; recovery will retry.'};
+}
 module.exports = {
+  recoverArtwork,incompleteArtwork,
   V2, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
   recordIntent, decideSitting, saveSitting, journeyAction, runMaintenance, runBackfill, buildMoments, markMomentsSeen,
   __testHooks: testHooks,

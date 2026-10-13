@@ -174,16 +174,29 @@ const httpServer = http.createServer(async (req, res) => {
       // Archived memories stay viewable (read-only) when explicitly requested.
       const includeArchived=u.searchParams.get("includeArchived")!=="0";
       maybeRunScrapbookMaintenance();
-      const relations=await scrapbook.listUserRelations(user.id);
+      const relationsPromise=scope==='personal'&&u.searchParams.get('includeRelations')==='0'?Promise.resolve([]):scrapbook.listUserRelations(user.id);
       // Scrapbook V2 is the only storage model: Our Story = one shared memory
       // per chapter journey, My Scrapbook = the caller's personal V2 rows.
       const flag=k=>u.searchParams.get(k)==="1";
       if(scope==='shared'){
-        const r=await scrapbook.listSharedV2(user.id,{chapterId:u.searchParams.get("chapterId")||null,relationId,includeHidden:flag("includeHidden"),includeRemoved:flag("includeRemoved")});
+        const [r,relations]=await Promise.all([scrapbook.listSharedV2(user.id,{chapterId:u.searchParams.get("chapterId")||null,relationId,includeHidden:flag("includeHidden"),includeRemoved:flag("includeRemoved")}),relationsPromise]);
         json(res,200,{ok:true,scope,entries:r.entries.slice(0,limit),relations,chapter:r.chapter,chapters:r.chapters}); return;
       }
-      const entries=await scrapbook.listPersonalV2(user.id,{limit,includeArchived,includeRemoved:flag("includeRemoved")});
+      const [entries,relations]=await Promise.all([scrapbook.listPersonalV2(user.id,{limit,includeArchived,includeRemoved:flag("includeRemoved")}),relationsPromise]);
       json(res,200,{ok:true,scope,entries,relations}); return;
+    }
+
+    if(path==='/api/scrapbook/artwork/recover'&&req.method==='POST'){
+      const user=await requireUser(req,res);if(!user)return;
+      const b=await readJson(req);
+      const r=await scrapbook.recoverArtwork(user.id,b);
+      json(res,r.status||200,r);return;
+    }
+    if(path==='/api/scrapbook/artwork/incomplete'&&req.method==='GET'){
+      const user=await requireUser(req,res);if(!user)return;
+      json(res,200,await scrapbook.incompleteArtwork(user.id,{
+        personalAfter:u.searchParams.get('personalAfter')||'',sharedAfter:u.searchParams.get('sharedAfter')||''}));
+      return;
     }
 
     if (path === "/api/scrapbook/entries" && req.method === "POST") {

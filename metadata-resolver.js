@@ -1,11 +1,16 @@
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const IMAGE_BASE = "https://image.tmdb.org/t/p";
 const cache = new Map();
+const inflight = new Map();
+const requestCache = new Map();
+const requestInflight = new Map();
+let activeRequests=0;
+const requestWaiters=[];
 const CACHE_MS = 12 * 60 * 60 * 1000;
 const MAX_TITLE = 240;
 
 function clean(v, max = MAX_TITLE) { return String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max); }
-function image(path, size = "w780") { return path ? `${IMAGE_BASE}/${size}${path.startsWith("/") ? path : `/${path}`}` : null; }
+function image(path, size = "w780") { return /^\/[a-zA-Z0-9_.-]+\.(?:jpg|jpeg|png|webp)$/i.test(String(path||'')) ? `${IMAGE_BASE}/${size}${path}` : null; }
 function normTitle(s) { return clean(s).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim(); }
 function similarity(a, b) {
   const A = new Set(normTitle(a).split(" ").filter(Boolean));
@@ -26,18 +31,45 @@ function scoreFor(q, name, isSlug) {
 function keyFor(q) { return JSON.stringify([q.title || q.canonicalTitle || "", q.type || "", q.season ?? null, q.episode ?? null]); }
 
 async function tmdb(path) {
+  const hit=requestCache.get(path);
+  if(hit&&Date.now()<hit.until)return hit.value;
+  if(requestInflight.has(path))return requestInflight.get(path);
+  const work=limitedRequest(path).then(value=>{
+    if(requestCache.size>=500)requestCache.delete(requestCache.keys().next().value);
+    requestCache.set(path,{value,until:Date.now()+(value?CACHE_MS:60000)});return value;
+  }).finally(()=>requestInflight.delete(path));
+  requestInflight.set(path,work);return work;
+}
+async function limitedRequest(path){
+  if(activeRequests>=4){
+    if(requestWaiters.length>=100)return null;
+    await new Promise(resolve=>requestWaiters.push(resolve));
+  }else activeRequests++;
+  try{return await tmdbRequest(path);}
+  finally{if(requestWaiters.length)requestWaiters.shift()();else activeRequests--;}
+}
+async function tmdbRequest(path) {
   const token = process.env.TMDB_API_TOKEN || "";
   if (!token) return null;
-  const r = await fetch(`${TMDB_BASE}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
-  if (!r.ok) { console.error("[SyncParty TMDB] request failed", r.status, String(path).split("?")[0]); return null; }
-  return r.json();
+  try {
+    const r = await fetch(`${TMDB_BASE}${path}`, { signal:AbortSignal.timeout(5000),headers: { Authorization: `Bearer ${token}`, Accept: "application/json" } });
+    if (!r.ok) { console.error("[SyncParty TMDB] request failed", r.status, String(path).split("?")[0]); return null; }
+    return await r.json();
+  } catch { return null; }
 }
 
-async function seasonCounts(id, numberOfSeasons) {
+async function seasonCounts(id, numberOfSeasons, seasons) {
   const counts = {};
-  for (let n = 1; n <= Math.min(Number(numberOfSeasons) || 0, 40); n++) {
-    const data = await tmdb(`/tv/${id}/season/${n}`);
-    if (data && Array.isArray(data.episodes)) counts[n] = data.episodes.filter(e => Number(e?.episode_number) > 0).length;
+  // The TV details response normally already contains every season count.
+  for(const s of Array.isArray(seasons)?seasons:[])
+    if(Number(s.season_number)>0&&Number.isInteger(s.episode_count)&&s.episode_count>=0)counts[s.season_number]=s.episode_count;
+  if(Object.keys(counts).length)return counts;
+  const deadline=Date.now()+6000;
+  for (let n = 1; n <= Math.min(Number(numberOfSeasons) || 0, 40)&&Date.now()<deadline; n+=3) {
+    await Promise.all(Array.from({length:Math.min(3,Math.min(Number(numberOfSeasons)||0,40)-n+1)},async(_,i)=>{
+      const data=await tmdb(`/tv/${id}/season/${n+i}`);
+      if(data&&Array.isArray(data.episodes))counts[n+i]=data.episodes.filter(e=>Number(e?.episode_number)>0).length;
+    }));
   }
   return counts;
 }
@@ -92,7 +124,7 @@ function queryCandidates(provisional, meta) {
   return out;
 }
 
-async function resolve(input = {}) {
+async function resolveUncached(input = {}) {
   const meta = input.meta || {};
   const provisional = input.provisional || {};
   const sHint = provisional.season ?? meta.season;
@@ -109,15 +141,16 @@ async function resolve(input = {}) {
   const animeHint = /\/anime(?:\/|$)/i.test(String(meta.pathname || "")) || (Array.isArray(meta.typeHints) ? meta.typeHints : []).some(h => /^anime$/i.test(String(h)));
   const wantsAnime = provisional.contentType === "anime" || (!provisional.contentType && animeHint);
   const preferred = wantsAnime ? "tv" : provisional.contentType;
-  const isEpisode = Number.isInteger(Number(eHint)) || Number.isInteger(Number(sHint));
+  const isEpisode = Number(eHint)>0 || Number(sHint)>0;
   let selected = null;
   let contentType = null;
   // The page may expose the real title in ANY of several fields (h1, JSON-LD,
   // slug, player title). Try each cleaned query in priority order and stop at
   // the first confident TMDB match, instead of betting on a single field.
   for (const q of queries) {
-    const movieData = preferred === "tv" ? null : await tmdb(`/search/movie?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`);
-    const tvData = preferred === "movie" ? null : await tmdb(`/search/tv?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`);
+    const [movieData,tvData]=await Promise.all([
+      preferred === "tv" ? null : tmdb(`/search/movie?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`),
+      preferred === "movie" ? null : tmdb(`/search/tv?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`)]);
     const movie = movieData?.results?.map(x => ({ ...x, _score: scoreFor(q, x.title || x.original_title, queries.slug.has(q)) + (x.release_date ? 0.02 : 0) })).sort((a,b) => b._score-a._score)[0] || null;
     const tv = tvData?.results?.map(x => ({ ...x, _score: scoreFor(q, x.name || x.original_name, queries.slug.has(q)) + (x.first_air_date ? 0.02 : 0) })).sort((a,b) => b._score-a._score)[0] || null;
     if (preferred === "movie" && movie && movie._score >= 0.45) { selected = movie; contentType = "movie"; }
@@ -139,7 +172,7 @@ async function resolve(input = {}) {
   } else {
     details = await tmdb(`/tv/${selected.id}?language=en-US`);
     if (details?.number_of_seasons) {
-      seriesEpisodeCounts = await seasonCounts(selected.id, details.number_of_seasons);
+      seriesEpisodeCounts = await seasonCounts(selected.id, details.number_of_seasons,details.seasons);
       storyTotalEpisodes = Object.values(seriesEpisodeCounts).reduce((a,b)=>a+b,0);
       if (storyTotalEpisodes > 0) storyProgressConfidence = Object.keys(seriesEpisodeCounts).length >= Math.min(details.number_of_seasons, 3) ? 0.92 : 0.75;
       // Do not infer that earlier episodes were watched merely because the
@@ -181,7 +214,7 @@ async function resolve(input = {}) {
     episode: Number.isInteger(Number(provisional.episode ?? meta.episode)) ? Number(provisional.episode ?? meta.episode) : null,
     episodeTitle,
     artwork: artworkCandidates[0] || null,
-    backdrop: image(details?.backdrop_path || selected.backdrop_path, "w1280") || artworkCandidates[0] || null,
+    backdrop: image(details?.backdrop_path || selected.backdrop_path, "w1280"),
     artworkCandidates: artworkCandidates.slice(0, 10),
     storyTotalEpisodes,
     storyEpisodesCompleted,
@@ -193,6 +226,43 @@ async function resolve(input = {}) {
     providerAttribution: "tmdb"
   };
   cache.set(key, { at: Date.now(), value });
+  if(cache.size>300)cache.delete(cache.keys().next().value);
   return value;
 }
-module.exports = { resolve };
+function resolve(input={}) {
+  const key=JSON.stringify(input);
+  if(inflight.has(key))return inflight.get(key);
+  const p=resolveUncached(input).finally(()=>inflight.delete(key));
+  inflight.set(key,p);return p;
+}
+// Artwork recovery uses the saved identity and NEVER changes its source key,
+// title, season or episode. Without a provider ID, require an exact title,
+// unique match and matching year/type, rather than fuzzy repair of an old row.
+async function recoverArtwork(entry={}) {
+  const type=entry.contentType==='movie'?'movie':['series','anime'].includes(entry.contentType)?'tv':null;
+  if(!type)return {artwork:null,backdrop:null};
+  let id=entry.metadataProvider==='tmdb'&&/^[1-9]\d*$/.test(String(entry.metadataId||''))?String(entry.metadataId):null;
+  if(!id){
+    const rawTitle=clean(entry.canonicalTitle||entry.title),title=cleanQuery(rawTitle);
+    const year=entry.metadataYear||Number(rawTitle.match(/\b((?:19|20)\d{2})\b/)?.[1])||null;
+    if(!title||/^(?:untitled|video on|episode \d+)/i.test(title))return {artwork:null,backdrop:null};
+    const data=await tmdb(`/search/${type}?query=${encodeURIComponent(title)}&include_adult=false&language=en-US&page=1`);
+    if(!data)return {artwork:null,backdrop:null,transient:true};
+    const hits=(data?.results||[]).filter(x=>
+      [x.title,x.original_title,x.name,x.original_name].some(v=>v&&normTitle(v)===normTitle(title))&&
+      (!year||Number(String(x.release_date||x.first_air_date||'').slice(0,4))===Number(year)));
+    if(hits.length!==1)return {artwork:null,backdrop:null};
+    id=String(hits[0].id);
+  }
+  const details=await tmdb(`/${type}/${id}?language=en-US`);
+  if(!details)return {artwork:null,backdrop:null,transient:true};
+  // Cards use the series poster/backdrop, not a fabricated episode portrait.
+  // Confirm a numbered episode exists before attaching show assets to it.
+  if(type==='tv'&&entry.season!=null&&entry.episode!=null){
+    if(!(Number(entry.season)>0&&Number(entry.episode)>0))return {artwork:null,backdrop:null};
+    const ep=await tmdb(`/tv/${id}/season/${Number(entry.season)}/episode/${Number(entry.episode)}?language=en-US`);
+    if(!ep)return {artwork:null,backdrop:null,transient:true};
+  }
+  return {artwork:image(details.poster_path),backdrop:image(details.backdrop_path,'w1280')};
+}
+module.exports = { resolve, recoverArtwork };
