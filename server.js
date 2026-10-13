@@ -518,16 +518,17 @@ function playbackPosition(x) {
 }
 function playbackPacket(room,event="heartbeat") {
   const x=playbackFor(room); if(!x)return null;
-  return { kind:"sync",event,authoritative:true,roomEpoch:x.epoch,
+  return { kind:"sync",event,authoritative:true,commandAcks:true,roomEpoch:x.epoch,
     revision:x.revision,sequence:++x.sequence,controllerId:x.controller,
     ...(x.initialized ? {time:playbackPosition(x)} : {}),playing:x.playing,
     rate:x.rate,sentAt:Date.now(),serverSentAt:Date.now(),pageKey:"",
     holds:[...x.holds].map(([id,h])=>({id,name:h.name,reasons:[...h.reasons]})) };
 }
-function publishPlayback(room,event="heartbeat",ws=null,observer=null) {
+function publishPlayback(room,event="heartbeat",ws=null,observer=null,ack=null) {
   const payload=playbackPacket(room,event); if(!payload)return;
   payload.id=observer?.clientId || "__relay__";
   if(observer)payload.observerPlaying=payload.playing;
+  if(ack)payload.ack=ack;
   if(ws)send(ws,{type:"message",payload}); else broadcast(room,{type:"message",payload});
 }
 function freezePlayback(x) {
@@ -570,19 +571,41 @@ function handlePlaybackMessage(ws,s,p) {
     return true;
   }
   if(p.kind!=="sync")return false;
+  const reply=(accepted,reason,event="resync",all=false)=>{
+    const ack=p.commandId ? {commandId:String(p.commandId),clientId:s.clientId,
+      event:String(p.event),accepted,reason} : null;
+    publishPlayback(s.room,event,all?null:ws,all?s:null,ack);
+    if(p.commandId&&accepted&&reason==="applied"&&["play","pause","seeking"].includes(event)){
+      const seconds=Math.max(0,Math.floor(playbackPosition(x)));
+      const position=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")}`;
+      const action=event==="play"?"resumed the video":event==="pause"?"paused the video":`jumped to ${position}`;
+      broadcast(s.room,{type:"message",payload:{kind:"system",eventId:`playback_${String(p.commandId)}`,
+        text:`${s.profile?.name||"A viewer"} ${action}`}});
+    }
+  };
   const seq=Number(p.syncSeq);
-  if(Number.isFinite(seq)){if(seq<=(s.lastSyncSeq||0))return true;s.lastSyncSeq=seq;}
-  if(p.roomEpoch&&p.roomEpoch!==x.epoch){publishPlayback(s.room,"resync",ws);return true;}
+  if(Number.isFinite(seq)){if(seq<=(s.lastSyncSeq||0)){reply(false,"out-of-order");return true;}s.lastSyncSeq=seq;}
+  if(p.roomEpoch&&p.roomEpoch!==x.epoch){reply(false,"old-room");return true;}
   const event=String(p.event||"heartbeat");
   if(!["heartbeat","resync","play","pause","seeking","seeked","ratechange"].includes(event))return true;
   const transition=activeTransition(s.room);
-  if(transition&&!transition.released)return true;
-  if(Number(p.sampleAgeMs)>2500){publishPlayback(s.room,"resync",ws);return true;}
+  if(transition&&!transition.released){reply(false,"navigation");return true;}
+  if(Number(p.sampleAgeMs)>2500){reply(false,"expired");return true;}
   if(event==="resync"){publishPlayback(s.room,"resync",ws);return true;}
   const continuation=event!=="heartbeat" && s.lastIntentRevision===x.revision &&
     Number(p.baseRevision)===s.lastIntentBase && x.controller===s.clientId;
-  if(Number.isFinite(Number(p.baseRevision))&&Number(p.baseRevision)<x.revision&&!continuation){
-    publishPlayback(s.room,"resync",ws);return true;
+  // Duplicate pause/play state is idempotent: it must not manufacture a new
+  // revision that invalidates an immediate legitimate Play from another tab.
+  if((event==="pause"&&!x.playing)||(event==="play"&&x.playing&&!x.holds.size)){
+    reply(true,"already-applied",event,true);return true;
+  }
+  // A fresh explicit, ordered Pause is a safe stop even if a competing rate
+  // or playback commit overtook its base revision. Never undo that user's
+  // stop by answering with a playing snapshot. Legacy/stale snapshots do
+  // not get this exception; Play and seeks still require causal revision.
+  const explicitPause=event==="pause"&&typeof p.commandId==="string"&&p.commandId.length>0;
+  if(Number.isFinite(Number(p.baseRevision))&&Number(p.baseRevision)<x.revision&&!continuation&&!explicitPause){
+    reply(false,"stale-revision");return true;
   }
   if(!x.initialized&&Number.isFinite(p.time)&&p.time>=0){
     x.time=p.time;x.at=playbackClock();x.initialized=true;x.controller=s.clientId;x.controllerAt=playbackClock();
@@ -590,20 +613,21 @@ function handlePlaybackMessage(ws,s,p) {
   }
   if(event==="heartbeat"){
     if(!x.controller||playbackClock()-x.controllerAt>12000)x.controller=s.clientId;
-    if(x.holds.size)return true;
+    if(x.holds.size){publishPlayback(s.room,"hold",ws);return true;}
     if(s.clientId!==x.controller){
       if(p.playing===x.playing)publishPlayback(s.room,"heartbeat",null,s);
+      else publishPlayback(s.room,"resync",ws);
       return true;
     }
     x.controllerAt=playbackClock();
-    if(p.playing!==x.playing)return true;
+    if(p.playing!==x.playing){publishPlayback(s.room,"resync",ws);return true;}
     const sample=Number(p.time);
     if(Number.isFinite(sample)&&Math.abs(sample-playbackPosition(x))<=1.25){
       x.time=Math.max(0,sample);x.at=playbackClock();
     }
     publishPlayback(s.room,"heartbeat",null,s);return true;
   }
-  if(x.holds.size&&event!=="pause"){publishPlayback(s.room,"hold",ws);return true;}
+  if(x.holds.size&&event!=="pause"){reply(false,"not-ready","hold");return true;}
   x.time=playbackPosition(x);x.at=playbackClock();
   if((event==="seeking"||event==="seeked")&&Number.isFinite(p.time)&&p.time>=0)x.time=p.time;
   if(event==="play")x.playing=true;
@@ -612,7 +636,7 @@ function handlePlaybackMessage(ws,s,p) {
   x.controller=s.clientId;x.controllerAt=playbackClock();
   s.lastIntentBase=Number.isFinite(Number(p.baseRevision))?Number(p.baseRevision):x.revision;
   x.revision++;s.lastIntentRevision=x.revision;
-  publishPlayback(s.room,event,null,s);return true;
+  reply(true,"applied",event,true);return true;
 }
 function retainEmptyRoom(room) {
   const x=playbackFor(room);if(x?.idleTimer)clearTimeout(x.idleTimer);
