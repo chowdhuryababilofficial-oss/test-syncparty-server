@@ -469,7 +469,7 @@ function announceLeft(room, id, name, event = "left") {
   broadcast(room, { type: "message", payload: { kind: "peer-connection", state: event, id, name, t: Date.now() } });
   presenceNotice(room, id, name, event);
 }
-function startDeparture(room, id, s) {
+function startDeparture(room, id, s, navigation = false) {
   const key = `${room}|${id}`;
   if (pendingDepartures.has(key)) return;
   const record = { ...transitionPeerRecord(s), reconnecting: true };
@@ -478,14 +478,18 @@ function startDeparture(room, id, s) {
     pendingDepartures.delete(key);
     rememberMember(room,id);
     releasePlaybackHold(room,id);
+    cleanupTransitionParticipant(room,id);
     broadcastPeers(room);
     announceLeft(room, id, record.name,"disconnected");
-    cleanupTransitionParticipant(room,id);
-  }, PRESENCE_GRACE_MS);
+  }, navigation ? NAV_DISCONNECT_GRACE_MS : PRESENCE_GRACE_MS);
   if (timer.unref) timer.unref();
   pendingDepartures.set(key, { timer, record, room, id });
-  holdPlayback(room,id,"connection",record.name);
-  broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "reconnecting", id, name: record.name, t: Date.now() } });
+  // Expected page navigation already has a playback barrier. It is not a
+  // network-loss notification, but it still needs cancellable member cleanup.
+  if (!navigation) {
+    holdPlayback(room,id,"connection",record.name);
+    broadcast(room, { type: "message", payload: { kind: "peer-connection", state: "reconnecting", id, name: record.name, t: Date.now() } });
+  }
 }
 function clearRoomDepartures(room, remember) {
   for (const [key, d] of [...pendingDepartures]) {
@@ -501,17 +505,18 @@ function broadcastPeers(room) {
   const t = activeTransition(room);
   const byId = new Map();
   for (const ws of set) {
-    const s = clients.get(ws); if (!s) continue;
-    byId.set(s.clientId || s.id, transitionPeerRecord(s));
+    const s = clients.get(ws);
+    if (!s || s.room !== room || ws.readyState !== 1 || clientSockets.get(s.clientId) !== ws) continue;
+    byId.set(s.clientId || s.id, { ...transitionPeerRecord(s), connected: true, reconnecting: false });
   }
   for (const d of pendingDepartures.values()) {
-    if (d.room === room && !byId.has(d.id)) byId.set(d.id, d.record);
+    if (d.room === room && !byId.has(d.id)) byId.set(d.id, { ...d.record, connected: false, reconnecting: true });
   }
   if (t) {
-    for (const [id, meta] of t.participants) if (!byId.has(id)) byId.set(id, { id, ...meta });
+    for (const [id, meta] of t.participants) if (!byId.has(id)) byId.set(id, { ...meta, id, connected: false, reconnecting: true });
   }
   const peers = [...byId.values()];
-  broadcast(room, { type: "peers", peers, count: peers.length });
+  broadcast(room, { type: "peers", peers, count: peers.filter(peer => peer.connected).length, memberCount: peers.length });
 }
 // Commands advance revision; snapshots advance sequence. A follower's
 // heartbeat cannot take over the timeline or undo a play/pause/seek intent.
@@ -773,7 +778,7 @@ function startNavigationTransition(room, initiator, p) {
   broadcast(room, { type: "message", payload: transitionPayload });
   return t;
 }
-function detachSocket(ws, announce = true, removeClient = true, explicit = false) {
+function detachSocket(ws, announce = true, removeClient = true, explicit = false, publish = true) {
   const s = clients.get(ws);
   if (!s) return;
   const room = s.room;
@@ -783,32 +788,33 @@ function detachSocket(ws, announce = true, removeClient = true, explicit = false
   const gracefulNavigation = !!(t && t.required.has(stableId) && !explicit);
   if (room && rooms.has(room)) {
     rooms.get(room).delete(ws);
+    if (gracefulNavigation && announce) startDeparture(room, stableId, s, true);
     if (explicit) {
       clearPendingDeparture(room,stableId);
       forgetMember(room,stableId);
       releasePlaybackHold(room,stableId);
       cleanupTransitionParticipant(room,stableId);
-      broadcastPeers(room);
+      if (publish) broadcastPeers(room);
       announceLeft(room,stableId,name);
       if (!rooms.get(room)?.size) retainEmptyRoom(room);
     } else if (rooms.get(room).size) {
       if (announce && !gracefulNavigation) {
         if (explicit) {
           clearPendingDeparture(room, stableId);
-          broadcastPeers(room);
+          if (publish) broadcastPeers(room);
           announceLeft(room, stableId, name);
         } else {
           startDeparture(room, stableId, s);
-          broadcastPeers(room);
+          if (publish) broadcastPeers(room);
         }
       } else {
-        broadcastPeers(room);
+        if (publish) broadcastPeers(room);
       }
     } else if (gracefulNavigation) {
       // Keep the room alive for the navigation handoff; the stable participant
       // remains represented by the transition snapshot until the grace window ends.
-      broadcastPeers(room);
-      setTimeout(() => cleanupTransitionParticipant(room, stableId), NAV_DISCONNECT_GRACE_MS).unref();
+      if (publish) broadcastPeers(room);
+      retainEmptyRoom(room);
     } else {
       // Last socket gone. If it was a drop (relay restart / everyone's network)
       // remember the members so their rejoin is not announced as a new arrival.
@@ -838,7 +844,11 @@ wss.on("connection", ws => {
 
     if (m.type === "join") {
       const room = norm(m.room); if (room.length !== 6) return;
-      const clientId = String(m.clientId || "").trim().slice(0, 128);
+      const requestedId = String(m.clientId || "").trim().slice(0, 128);
+      // Bind identity once per socket. Repeated join cannot leave an old map
+      // entry or change the author of later presence/chat messages.
+      if (s.clientId && requestedId && requestedId !== s.clientId) return;
+      const clientId = s.clientId || requestedId || s.id;
       let replacedLiveSocket = false;
       const repeatedJoin = s.room === room;
       const navKnown = !!activeTransition(room)?.participants.has(clientId);
@@ -849,7 +859,7 @@ wss.on("connection", ws => {
         if (old && old !== ws) {
           // Same tab, newer socket (reload / network handover): continuity, not a new arrival.
           replacedLiveSocket = clients.get(old)?.room === room;
-          detachSocket(old,!replacedLiveSocket,true,!replacedLiveSocket);
+          detachSocket(old,!replacedLiveSocket,true,!replacedLiveSocket,!replacedLiveSocket);
           try { old.close(4001, "replaced by newer tab connection"); } catch {}
         }
       }
@@ -917,6 +927,8 @@ wss.on("connection", ws => {
       if (!p || typeof p !== "object") return;
 
       const kind = String(p.kind || "");
+      // Connection transitions are relay-owned, never peer-supplied.
+      if (kind === "peer-connection") return;
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
         "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
@@ -961,7 +973,7 @@ wss.on("connection", ws => {
           ...(kind === "system" ? {presenceEvent:undefined,eventId:undefined} : {}),
           transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
           url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
-          id: p.id || s.id,
+          id: s.clientId || s.id,
           name: profile.name,
           avatar: profile.avatar,
           color: profile.color
