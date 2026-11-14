@@ -28,7 +28,7 @@ function scoreFor(q, name, isSlug) {
   }
   return s;
 }
-function keyFor(q) { return JSON.stringify([q.title || q.canonicalTitle || "", q.type || "", q.season ?? null, q.episode ?? null]); }
+function keyFor(q) { return JSON.stringify([q.title || q.canonicalTitle || "", q.type || "", q.year ?? null, q.season ?? null, q.episode ?? null]); }
 
 async function tmdb(path) {
   const hit=requestCache.get(path);
@@ -129,10 +129,11 @@ async function resolveUncached(input = {}) {
   const provisional = input.provisional || {};
   const sHint = provisional.season ?? meta.season;
   const eHint = provisional.episode ?? meta.episode;
+  const yearHint = Number(provisional.metadataYear ?? meta.metadataYear ?? meta.seriesYear) || null;
   const queries = queryCandidates(provisional, meta);
   if (!queries.length) return null;
   let rawTitle = queries[0];
-  const key = keyFor({ title: queries.join("|"), type: provisional.contentType, season: sHint, episode: eHint });
+  const key = keyFor({ title: queries.join("|"), type: provisional.contentType, year: yearHint, season: sHint, episode: eHint });
   const hit = cache.get(key); if (hit && Date.now() - hit.at < CACHE_MS) return hit.value;
 
   // When the classifier had no title to work with (identity only in slug /
@@ -152,7 +153,20 @@ async function resolveUncached(input = {}) {
       preferred === "tv" ? null : tmdb(`/search/movie?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`),
       preferred === "movie" ? null : tmdb(`/search/tv?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`)]);
     const movie = movieData?.results?.map(x => ({ ...x, _score: scoreFor(q, x.title || x.original_title, queries.slug.has(q)) + (x.release_date ? 0.02 : 0) })).sort((a,b) => b._score-a._score)[0] || null;
-    const tv = tvData?.results?.map(x => ({ ...x, _score: scoreFor(q, x.name || x.original_name, queries.slug.has(q)) + (x.first_air_date ? 0.02 : 0) })).sort((a,b) => b._score-a._score)[0] || null;
+    const tvRows = (tvData?.results || []).map(x => {
+      const candidateYear = Number(String(x.first_air_date || '').slice(0,4)) || null;
+      const exactTitle = [x.name, x.original_name].some(v => v && normTitle(v) === normTitle(q));
+      let score = scoreFor(q, x.name || x.original_name, queries.slug.has(q)) + (candidateYear ? 0.02 : 0);
+      if (yearHint && candidateYear === yearHint) score += 0.18;
+      else if (yearHint && candidateYear && candidateYear !== yearHint) score = -1;
+      return { ...x, _score: score, _candidateYear: candidateYear, _exactTitle: exactTitle };
+    }).sort((a,b) => b._score-a._score);
+    // Do not guess between same-named remakes. With a year hint, only a
+    // matching first-air year is eligible; without one, require one exact-name
+    // result. Ambiguous/fuzzy matches remain unresolved and the watch can
+    // still be saved under a provisional identity.
+    const exactTvRows = tvRows.filter(x => x._exactTitle && (!yearHint || x._candidateYear === yearHint));
+    const tv = exactTvRows.length === 1 ? exactTvRows[0] : (!yearHint && exactTvRows.length > 1 ? null : (yearHint ? null : (tvRows[0]?._score >= 0.85 ? tvRows[0] : null)));
     if (preferred === "movie" && movie && movie._score >= 0.45) { selected = movie; contentType = "movie"; }
     else if ((preferred === "series" || preferred === "anime" || isEpisode) && tv && tv._score >= 0.45) { selected = tv; contentType = wantsAnime ? "anime" : "series"; }
     else if (tv && tv._score >= 0.62 && (!movie || tv._score >= movie._score)) { selected = tv; contentType = wantsAnime ? "anime" : "series"; }
