@@ -1,4 +1,5 @@
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity, getAccountPreferences, setQuickReactions, markNotificationsRead } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
@@ -35,7 +36,8 @@ const NAV_TRANSITION_TTL_MS = 30000;
 const NAV_DISCONNECT_GRACE_MS = 15000;
 
 function json(res, status, body, extra={}) {
-  res.writeHead(status, { "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"Content-Type, Authorization", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", ...extra });
+  const requestId = res.getHeader?.("X-Request-ID");
+  res.writeHead(status, { "Content-Type":"application/json", "Cache-Control":"no-store", "Access-Control-Allow-Origin":"*", "Access-Control-Allow-Headers":"Content-Type, Authorization, X-Request-ID, X-SyncParty-Operation", "Access-Control-Allow-Methods":"GET,POST,OPTIONS", ...(requestId ? { "X-Request-ID": requestId } : {}), ...extra });
   res.end(JSON.stringify(body));
 }
 async function readJson(req) {
@@ -58,6 +60,9 @@ const httpServer = http.createServer(async (req, res) => {
   }
   if (!req.url.startsWith("/api/")) { json(res,404,{ok:false,error:"Not found"}); return; }
 
+  const suppliedRequestId=String(req.headers["x-request-id"]||"").trim();
+  req.spRequestId=/^[A-Za-z0-9._:-]{1,120}$/.test(suppliedRequestId)?suppliedRequestId:crypto.randomUUID();
+  res.setHeader("X-Request-ID",req.spRequestId);
   try {
     const u=new URL(req.url,"http://localhost");
     const path=u.pathname;
@@ -202,6 +207,9 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/entries" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       let relation=null;
+      if(!b.entry||typeof b.entry!=='object'||Array.isArray(b.entry)||!String(b.entry.sourceKey||'').trim()){
+        json(res,400,{ok:false,persisted:false,error:'A valid Scrapbook memory identity is required.',requestId:req.spRequestId});return;
+      }
       if(b.scope==='shared'){
         // The client sends the RELATION id, so it has to be looked up by id.
         // getRelation() takes two USER ids, so it never matched and every
@@ -217,7 +225,18 @@ const httpServer = http.createServer(async (req, res) => {
       // /keep, older clients) only ever updates the CALLER's member totals in
       // V2 storage - never a copy per partner, never a personal duplicate.
       const created=[await scrapbook.upsertEntry(user.id,b.entry,b.scope==='shared'?relation.id:null)];
-      json(res,200,{ok:true,entries:created}); return;
+      const saved=created[0]||null;
+      if(!saved){
+        console.error('[SyncParty Scrapbook keep]',{requestId:req.spRequestId,operation:'entry-save',scope:b.scope==='shared'?'shared':'personal',sourceKey:String(b.entry.sourceKey).slice(0,180),httpStatus:503,persisted:false,code:'EMPTY_WRITE_RESULT'});
+        json(res,503,{ok:false,persisted:false,retryable:true,error:'The server did not confirm that this memory was saved.',requestId:req.spRequestId});return;
+      }
+      console.info('[SyncParty Scrapbook keep]',{
+        requestId:req.spRequestId,operation:'entry-save',scope:b.scope==='shared'?'shared':'personal',httpStatus:200,
+        sourceKey:String(b.entry?.sourceKey||'').slice(0,180),contentType:String(b.entry?.contentType||b.entry?.kind||'').slice(0,24),
+        metadataProvider:String(b.entry?.metadataProvider||'').slice(0,32),metadataId:String(b.entry?.metadataId||'').slice(0,64),
+        season:b.entry?.season??null,episode:b.entry?.episode??null,persisted:!!saved,recordId:saved?.id||null
+      });
+      json(res,200,{ok:true,persisted:!!saved,requestId:req.spRequestId,entries:created}); return;
     }
 
     if (path === "/api/scrapbook/entries/bulk" && req.method === "POST") {
@@ -340,7 +359,20 @@ const httpServer = http.createServer(async (req, res) => {
       const r=kind==="intent"?await scrapbook.recordIntent(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null,playing:!!b.playing})
         :kind==="decide"?await scrapbook.decideSitting(user.id,{sittingId:b.sittingId,sourceKey:b.sourceKey,roomId:b.roomId||null})
         :kind==="save"?await scrapbook.saveSitting(user.id,b):{status:404,error:'Not found'};
-      if(r.error){json(res,r.status||400,{ok:false,error:r.error});return;}
+      if(r.error){json(res,r.status||400,{ok:false,error:r.error,requestId:req.spRequestId});return;}
+      if(kind==='save') {
+        const persisted=scrapbook.wasSittingSavePersisted(r);
+        console.info('[SyncParty Scrapbook keep]',{
+          requestId:req.spRequestId,operation:'sitting-save',httpStatus:persisted?200:409,sittingId:String(b.sittingId||'').slice(0,80),
+          sourceKey:String(b.entry?.sourceKey||'').slice(0,180),sequence:Number(b.seq)||0,
+          destination:r.decision?.destination||r.target?.destination||null,targetId:r.target?.id||null,
+          persisted,duplicate:!!r.duplicate,ignored:r.ignored||null
+        });
+        if(!persisted){
+          json(res,409,{ok:false,persisted:false,error:r.ignored?`This save was not written (${String(r.ignored).slice(0,48)}).`:'The server could not confirm that this memory was saved.',ignored:r.ignored||null,requestId:req.spRequestId});return;
+        }
+        json(res,200,{ok:true,...r,persisted:true,requestId:req.spRequestId});return;
+      }
       json(res,200,{ok:true,...r}); return;
     }
 
@@ -379,14 +411,23 @@ const httpServer = http.createServer(async (req, res) => {
 
     json(res,404,{ok:false,error:'Not found'});
   } catch (e) {
-    console.error('[SyncParty Scrapbook API]',e);
+    // Preserve the request ID and effective HTTP result in the sanitized log
+    // so a client retry can be correlated with a committed/failed write.
+    const httpStatus = e && ['SP_LOCK_TIMEOUT','SP_FENCED','SP_SCHEMA_MISSING'].includes(e.code) ? 503
+      : e && ['SPV01','SPC01','SPR01'].includes(e.code) ? 409 : 500;
+    console.error('[SyncParty Scrapbook API]',{
+      requestId:req.spRequestId||null,operation:`${req.method} ${String(req.url||'').split('?')[0]}`,httpStatus,
+      code:String(e?.code||e?.status||'INTERNAL').slice(0,60),
+      message:String(e?.message||'SyncParty server error.').slice(0,240),
+      detail:String(e?.details||'').slice(0,240)
+    });
     // Scrapbook v2: a lock wait that timed out, a lock that moved to another
     // server (fenced) or missing 9.7/9.8 functions are retryable 503s; a
     // transition the database refused (SPV01/SPC01/SPR01) is a 409.
-    if (e && ['SP_LOCK_TIMEOUT','SP_FENCED','SP_SCHEMA_MISSING'].includes(e.code)) { json(res,503,{ok:false,error:e.message,retryable:true}); return; }
-    if (e && ['SPV01','SPC01','SPR01'].includes(e.code)) { json(res,409,{ok:false,error:'This Scrapbook change is no longer possible; refresh and try again.'}); return; }
+    if (httpStatus === 503) { json(res,503,{ok:false,error:e.message,retryable:true,requestId:req.spRequestId}); return; }
+    if (httpStatus === 409) { json(res,409,{ok:false,error:'This Scrapbook change is no longer possible; refresh and try again.',requestId:req.spRequestId}); return; }
     const message = process.env.NODE_ENV === 'production' ? 'SyncParty server error.' : (e?.message || 'SyncParty server error.');
-    json(res,500,{ok:false,error:message});
+    json(res,500,{ok:false,error:message,requestId:req.spRequestId});
   }
 });
 

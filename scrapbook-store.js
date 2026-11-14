@@ -67,6 +67,48 @@ function rowToEntry(row) {
 
 const CONTENT_TYPES = ["movie","series","anime","manual"];
 
+// The episode identity extension columns are additive and may not exist yet
+// on a previously deployed Supabase project. Saving a personal memory must
+// remain available during that rollout: retain the canonical source key and
+// the original metadata columns, while omitting only the six optional fields
+// until the migration has been applied.
+const OPTIONAL_EPISODE_COLUMNS = Object.freeze([
+  "episode_metadata_provider", "episode_metadata_id", "episode_numbering_system",
+  "absolute_episode_number", "media_position_sec", "media_duration_sec"
+]);
+function missingOptionalEpisodeColumn(error) {
+  const code = String(error?.code || "");
+  if (!(["PGRST204", "42703"].includes(code))) return null;
+  const message = String(error?.message || error?.details || "");
+  return OPTIONAL_EPISODE_COLUMNS.find(column => new RegExp(`\\b${column}\\b`, "i").test(message)) || null;
+}
+function withoutOptionalEpisodeColumns(value) {
+  const out = { ...(value || {}) };
+  for (const column of OPTIONAL_EPISODE_COLUMNS) delete out[column];
+  return out;
+}
+async function writePersonalRow(queryForValues, values) {
+  let result = await queryForValues(values);
+  const absent = missingOptionalEpisodeColumn(result?.error);
+  if (absent) {
+    result = await queryForValues(withoutOptionalEpisodeColumns(values));
+    if (!result?.error) {
+      console.warn("[SyncParty Scrapbook] saved personal memory using legacy schema; optional episode column unavailable", { column: absent });
+    }
+  }
+  if (result?.error) throw result.error;
+  return result?.data ?? null;
+}
+function suppressDuplicateEntryDeltas(entry, existing) {
+  // Direct /entries saves lack the V2 (sittingId, seq) ledger. A replay of
+  // the same or an older client event (e.g. response lost after commit) must
+  // not add its watch/session deltas again. A later event still accumulates.
+  const incomingAt = Number(entry?.lastWatchedAt) || 0;
+  const savedAt = Number(existing?.last_watched_at) || 0;
+  if (!incomingAt || incomingAt > savedAt) return entry;
+  return { ...entry, watchDurationDeltaSec: 0, togetherDurationDeltaSec: 0, sessionCountDelta: 0 };
+}
+
 // --- artwork provenance -----------------------------------------------------
 // TMDB artwork is canonical. Page-derived images (og:image, site art) may only
 // fill an EMPTY slot or replace other non-TMDB art; they can never override
@@ -295,13 +337,13 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
   if (findError) throw findError;
 
   if (existing) {
-    const patch = normalizeEntry({ ...entry, sourceKey }, existing);
-    const { data, error } = await sb.from("scrapbook_entries")
-      .update(patch)
+    const event = suppressDuplicateEntryDeltas({ ...entry, sourceKey }, existing);
+    const patch = normalizeEntry(event, existing);
+    const data = await writePersonalRow(values => sb.from("scrapbook_entries")
+      .update(values)
       .eq("id", existing.id)
       .select("*")
-      .maybeSingle();
-    if (error) throw error;
+      .maybeSingle(), patch);
     return rowToEntry(data);
   }
 
@@ -331,11 +373,11 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
       }));
       if (matches.length === 1) {
         const legacy = matches[0];
-        const patch = normalizeEntry({ ...entry, sourceKey }, legacy);
-        const { data: rekeyed, error: rekeyError } = await sb.from("scrapbook_entries")
-          .update(patch).eq("id", legacy.id).select("*").maybeSingle();
-        if (!rekeyError && rekeyed) return rowToEntry(rekeyed);
-        if (rekeyError && rekeyError.code !== "23505") throw rekeyError;
+        const event = suppressDuplicateEntryDeltas({ ...entry, sourceKey }, legacy);
+        const patch = normalizeEntry(event, legacy);
+        const rekeyed = await writePersonalRow(values => sb.from("scrapbook_entries")
+          .update(values).eq("id", legacy.id).select("*").maybeSingle(), patch);
+        if (rekeyed) return rowToEntry(rekeyed);
       }
     }
   }
@@ -356,7 +398,15 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // An existing deployment may not yet have the optional artwork/title columns.
     // Retry only the legacy-compatible fields; anime still correctly requires the
     // existing kind/content_type constraint to permit it.
-    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|episode_metadata_provider|episode_metadata_id|episode_numbering_system|absolute_episode_number|media_position_sec|media_duration_sec|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    const absentEpisodeColumn = missingOptionalEpisodeColumn(error);
+    if (absentEpisodeColumn) {
+      // Preserve the existing series provider metadata and canonical source
+      // key; only the six additive columns are omitted before the migration.
+      const compatible = await sb.from("scrapbook_entries").insert(withoutOptionalEpisodeColumns(row)).select("*").maybeSingle();
+      if (!compatible.error) return rowToEntry(compatible.data);
+      error = compatible.error;
+    }
+    const modernSchemaError = !absentEpisodeColumn && /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
       // Every column named in the regex above must be stripped here too —
       // this list previously only dropped the original three (content_type/
@@ -1013,7 +1063,8 @@ async function ensurePersonalRow(userId, entry, sourceKey) {
   const scope = personalScope(gen);
   const existing = await q(sbx().from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", scope).eq("source_key", sourceKey).maybeSingle());
   if (existing) {
-    return q(sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, existing)).eq("id", existing.id).select("*").maybeSingle());
+    return writePersonalRow(values => sbx().from("scrapbook_entries").update(values).eq("id", existing.id).select("*").maybeSingle(),
+      identityPatch({ ...entry, sourceKey }, existing));
   }
   const hasCoordinates=seasonIntOrNull(entry.season)!=null&&positiveIntOrNull(entry.episode)!=null;
   const hasEpisodeId=!!(entry.episodeMetadataProvider&&entry.episodeMetadataId);
@@ -1034,7 +1085,14 @@ async function ensurePersonalRow(userId, entry, sourceKey) {
     if (hasAbsolute) candidateQueries.push(baseCandidateQuery()
       .eq("episode_numbering_system","absolute").eq("absolute_episode_number",positiveIntOrNull(entry.absoluteEpisodeNumber))
       .eq("metadata_provider",entry.metadataProvider).eq("metadata_id",String(entry.metadataId)).limit(500));
-    const candidateResults=await Promise.all(candidateQueries.map(query=>query));
+    const candidateResults=await Promise.all(candidateQueries.map(async query=>{
+      const result=await query;
+      // A pre-migration database cannot filter by the new episode-only
+      // columns. Skip that one reconciliation handle, but still run any
+      // season/episode + existing series-provider query that is available.
+      if (missingOptionalEpisodeColumn(result?.error)) return { data: [], error: null, optionalColumnUnavailable: true };
+      return result;
+    }));
     const candidateMap=new Map();
     for (const result of candidateResults) {
       if (result.error) throw result.error;
@@ -1048,18 +1106,21 @@ async function ensurePersonalRow(userId, entry, sourceKey) {
       canonicalTitle:r.canonical_title || r.title, title:r.title, season:r.season, episode:r.episode
     }));
     if (matches.length === 1) {
-      const { data, error: updateError } = await sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, matches[0])).eq("id", matches[0].id).select("*").maybeSingle();
-      if (!updateError && data) return data;
-      if (updateError && updateError.code !== "23505") throw updateError;
+      try {
+        return await writePersonalRow(values => sbx().from("scrapbook_entries").update(values).eq("id", matches[0].id).select("*").maybeSingle(),
+          identityPatch({ ...entry, sourceKey }, matches[0]));
+      } catch (updateError) {
+        if (updateError.code !== "23505") throw updateError;
+      }
     }
   }
   const row = { id: id("entry"), user_id: userId, scope, relation_id: null, ...identityPatch({ ...entry, sourceKey }, null), watch_duration_sec: 0, together_duration_sec: 0, session_count: 0, created_at: now() };
-  const { data, error } = await sbx().from("scrapbook_entries").insert(row).select("*").maybeSingle();
-  if (error) {
+  try {
+    return await writePersonalRow(values => sbx().from("scrapbook_entries").insert(values).select("*").maybeSingle(), row);
+  } catch (error) {
     if (error.code === "23505") return q(sbx().from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", scope).eq("source_key", sourceKey).maybeSingle());
     throw error;
   }
-  return data;
 }
 
 async function getMemory(memoryId) { return q(sbx().from("shared_memories").select("*").eq("id", String(memoryId)).maybeSingle()); }
@@ -1115,6 +1176,13 @@ async function targetRemoved(destination, target) {
   const gen = scopeGeneration(target.scope) || 1;
   const st = (await journeyStateRows(personalSpace(target.user_id), journeyKeyOf(rowToEntry(target)))).find(r => Number(r.generation) === gen);
   return !!(st && st.removed_at != null);
+}
+
+// A sitting acknowledgement means an actual target write (or a confirmed
+// replay of a ledger entry that was already written). Ignored/removed saves
+// must never be surfaced to the extension as account-persisted.
+function wasSittingSavePersisted(result) {
+  return !!(result?.ok && !result.ignored && (result.target?.id || result.duplicate === true));
 }
 
 // ------------------------------------------------------------ sittings
@@ -1370,7 +1438,8 @@ async function saveSitting(userId, body = {}) {
         if (await targetRemoved(d.destination, target)) return { ok: true, ignored: "removed", decision: view };
         if (d.destination === "SHARED") await ensureSharedMemory(d.chapter_id, entry, sourceKey);
         else {
-          await q(sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, target)).eq("id", targetId));
+          await writePersonalRow(values => sbx().from("scrapbook_entries").update(values).eq("id", targetId),
+            identityPatch({ ...entry, sourceKey }, target));
           jk = journeyKeyOf(rowToEntry(target)); gen = scopeGeneration(target.scope) || 1;
         }
       } else {
@@ -1430,7 +1499,15 @@ async function directSharedSave(userId, relationId, entry) {
     const mem = await ensureSharedMemory(chapter.id, entry, sourceKey);
     const m0 = await ensureMember(mem.id, String(userId));
     const t = now();
-    await bumpTotals("shared_memory_members", m0.id, { watch: toInt(entry.watchDurationDeltaSec), together: toInt(entry.togetherDurationDeltaSec), sessions: toInt(entry.sessionCountDelta), touch: true }, t);
+    const incomingAt = Number(entry.lastWatchedAt) || t;
+    const hasPriorEvent = Number(m0.watch_sec || 0) > 0 || Number(m0.together_sec || 0) > 0 || Number(m0.session_count || 0) > 0;
+    const replay = hasPriorEvent && incomingAt <= Number(m0.last_watched_at || 0);
+    await bumpTotals("shared_memory_members", m0.id, {
+      watch: replay ? 0 : toInt(entry.watchDurationDeltaSec),
+      together: replay ? 0 : toInt(entry.togetherDurationDeltaSec),
+      sessions: replay ? 0 : toInt(entry.sessionCountDelta),
+      touch: !replay
+    }, incomingAt);
     const m = await q(sbx().from("shared_memory_members").select("*").eq("id", m0.id).maybeSingle());
     const tg = Number(m?.together_sec || 0), s = Number(m?.session_count || 0);
     const fresh = await getMemory(mem.id);
@@ -1974,7 +2051,7 @@ async function recoverArtwork(userId, {recordId,scope}={}) {
 module.exports = {
   recoverArtwork,incompleteArtwork,
   V2, journeyKeyOf, chaptersForUser, activeChapterForUser, listPersonalV2, listSharedV2,
-  recordIntent, decideSitting, saveSitting, journeyAction, runMaintenance, runBackfill, buildMoments, markMomentsSeen,
+  recordIntent, decideSitting, saveSitting, wasSittingSavePersisted, journeyAction, runMaintenance, runBackfill, buildMoments, markMomentsSeen,
   __testHooks: testHooks,
   id,
   now,
