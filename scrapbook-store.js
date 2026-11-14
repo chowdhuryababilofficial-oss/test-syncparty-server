@@ -34,9 +34,15 @@ function rowToEntry(row) {
     artworkCandidates: Array.isArray(row.artwork_candidates) ? row.artwork_candidates : [],
     canonicalTitle: row.canonical_title || row.title,
     platform: row.platform,
-    season: positiveIntOrNull(row.season),
+    season: seasonIntOrNull(row.season),
     episode: positiveIntOrNull(row.episode),
     episodeTitle: row.episode_title || null,
+    episodeMetadataProvider: row.episode_metadata_provider || "",
+    episodeMetadataId: row.episode_metadata_id || "",
+    episodeNumberingSystem: row.episode_numbering_system || "",
+    absoluteEpisodeNumber: positiveIntOrNull(row.absolute_episode_number),
+    mediaPositionSec: nonNegativeIntOrNull(row.media_position_sec),
+    mediaDurationSec: nonNegativeIntOrNull(row.media_duration_sec),
     progress: Number(row.progress || 0),
     status: row.status,
     watchDurationSec: Number(row.watch_duration_sec || 0),
@@ -92,8 +98,8 @@ function normalizeEntry(entry, existing = null) {
   const t = now();
   const providerMatchesExisting = !existing?.metadata_provider || !existing?.metadata_id ||
     (String(entry.metadataProvider || "").toLowerCase() === String(existing.metadata_provider || "").toLowerCase() && String(entry.metadataId || "") === String(existing.metadata_id || ""));
-  const incomingSeason = positiveIntOrNull(entry.season), incomingEpisode = positiveIntOrNull(entry.episode);
-  const episodeCoordinatesConflict = (positiveIntOrNull(existing?.season) && incomingSeason && positiveIntOrNull(existing.season) !== incomingSeason) ||
+  const incomingSeason = seasonIntOrNull(entry.season), incomingEpisode = positiveIntOrNull(entry.episode);
+  const episodeCoordinatesConflict = (seasonIntOrNull(existing?.season) != null && incomingSeason != null && seasonIntOrNull(existing.season) !== incomingSeason) ||
     (positiveIntOrNull(existing?.episode) && incomingEpisode && positiveIntOrNull(existing.episode) !== incomingEpisode);
   const incomingMatchesExisting = providerMatchesExisting && !episodeCoordinatesConflict;
   const preserveVerifiedMetadata = !!(existing?.metadata_provider && existing?.metadata_id && !incomingMatchesExisting);
@@ -114,16 +120,35 @@ function normalizeEntry(entry, existing = null) {
     // entry.season/episode arrive as null for movies; Number(null) is 0 and
     // Number.isFinite(0) is true, so guard against null explicitly or every
     // movie would be written as "season 0".
-    // Only a positive integer is a real season/episode. Refusing to carry a
-    // legacy 0 forward from `existing` also heals rows already poisoned with
-    // 0 on their next save.
-    season: (preserveVerifiedMetadata ? positiveIntOrNull(existing?.season) : positiveIntOrNull(entry.season)) ?? positiveIntOrNull(existing?.season),
+    // Season zero is a valid Specials season; null is unknown.
+    season: (preserveVerifiedMetadata ? seasonIntOrNull(existing?.season) : seasonIntOrNull(entry.season)) ?? seasonIntOrNull(existing?.season),
     episode: (preserveVerifiedMetadata ? positiveIntOrNull(existing?.episode) : positiveIntOrNull(entry.episode)) ?? positiveIntOrNull(existing?.episode),
     // Missing or conflicting lower-confidence metadata never erases a known
     // episode name; a matching authoritative provider may correct it.
     episode_title: (preserveVerifiedMetadata ? existing?.episode_title : (entry.episodeTitle || existing?.episode_title)) ? String(preserveVerifiedMetadata ? existing.episode_title : (entry.episodeTitle || existing.episode_title)).slice(0,240) : null,
-    progress: Math.max(0, Math.min(1, Number(entry.progress) || Number(existing?.progress || 0))),
-    status: ["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching"),
+    episode_metadata_provider: String(existing?.episode_metadata_provider || entry.episodeMetadataProvider || "").slice(0,40),
+    episode_metadata_id: String(existing?.episode_metadata_id || entry.episodeMetadataId || "").slice(0,80),
+    episode_numbering_system: String(existing?.episode_numbering_system || entry.episodeNumberingSystem || "").slice(0,40),
+    absolute_episode_number: positiveIntOrNull(existing?.absolute_episode_number ?? entry.absoluteEpisodeNumber),
+    progress: Math.max(fractionOrZero(entry.progress), fractionOrZero(existing?.progress)),
+    // Latest media position and media duration are snapshots, never watch-time
+    // accumulators. Furthest progress is stored separately above. Clamp a
+    // snapshot to its own duration when one is available.
+    media_position_sec: (() => {
+      const incomingAt=Number(entry.lastWatchedAt)||t, existingAt=Number(existing?.last_watched_at)||0;
+      const raw=nonNegativeIntOrNull(entry.mediaPositionSec ?? entry.currentTime);
+      const duration=nonNegativeIntOrNull(entry.mediaDurationSec ?? entry.duration) ?? nonNegativeIntOrNull(existing?.media_duration_sec);
+      if (existing && incomingAt < existingAt) return nonNegativeIntOrNull(existing.media_position_sec);
+      if (raw == null) return nonNegativeIntOrNull(existing?.media_position_sec);
+      return duration == null ? raw : Math.min(raw,duration);
+    })(),
+    media_duration_sec: (() => {
+      const incomingAt=Number(entry.lastWatchedAt)||t, existingAt=Number(existing?.last_watched_at)||0;
+      const raw=nonNegativeIntOrNull(entry.mediaDurationSec ?? entry.duration);
+      if (existing && incomingAt < existingAt) return nonNegativeIntOrNull(existing.media_duration_sec);
+      return raw ?? nonNegativeIntOrNull(existing?.media_duration_sec);
+    })(),
+    status: existing?.status === "completed" || entry.status === "completed" ? "completed" : (["completed", "watching", "paused"].includes(entry.status) ? entry.status : (existing?.status || "watching")),
     watch_duration_sec: toInt(existing
       ? Number(existing.watch_duration_sec || 0) + (Number(entry.watchDurationDeltaSec) || 0)
       : (Number(entry.watchDurationDeltaSec) || Number(entry.watchDurationSec) || 0)),
@@ -144,8 +169,8 @@ function normalizeEntry(entry, existing = null) {
     metadata_year: Number(existing?.metadata_year) > 0 ? Math.round(Number(existing.metadata_year)) : (Number(entry.metadataYear) > 0 ? Math.round(Number(entry.metadataYear)) : null),
     story_total_episodes: preserveVerifiedMetadata ? toInt(Number(existing?.story_total_episodes || 0)) : toInt(Number(entry.storyTotalEpisodes) || Number(existing?.story_total_episodes || 0)),
     story_episodes_completed: preserveVerifiedMetadata ? toInt(Number(existing?.story_episodes_completed || 0)) : toInt(Number(entry.storyEpisodesCompleted) || Number(existing?.story_episodes_completed || 0)),
-    story_progress: preserveVerifiedMetadata || entry.storyProgress == null ? (existing?.story_progress ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgress))),
-    story_progress_confidence: preserveVerifiedMetadata || entry.storyProgressConfidence == null ? (existing?.story_progress_confidence ?? null) : Math.max(0, Math.min(1, Number(entry.storyProgressConfidence))),
+    story_progress: preserveVerifiedMetadata || entry.storyProgress == null ? (existing?.story_progress ?? null) : fractionOrZero(entry.storyProgress),
+    story_progress_confidence: preserveVerifiedMetadata || entry.storyProgressConfidence == null ? (existing?.story_progress_confidence ?? null) : fractionOrZero(entry.storyProgressConfidence),
     series_episode_counts: !preserveVerifiedMetadata && entry.seriesEpisodeCounts && typeof entry.seriesEpisodeCounts === "object" ? entry.seriesEpisodeCounts : (existing?.series_episode_counts || null),
     first_watched_at: Math.round(Math.min(Number(existing?.first_watched_at || 0) || Number(entry.firstWatchedAt) || t, Number(entry.firstWatchedAt) || t)),
     last_watched_at: Math.round(Math.max(Number(existing?.last_watched_at || 0), Number(entry.lastWatchedAt) || t)),
@@ -170,14 +195,26 @@ async function getUser(userId) {
 // archived_at / ended_at are additive columns. Ending or archiving an Our
 // Story never deletes the relation or any shared memory — it only stamps the
 // relation so it stops being the ONE active story and becomes read-only.
-// A season/episode number is meaningful only as a POSITIVE integer. 0, "",
-// NaN and negatives all mean "unknown" and must be stored/returned as NULL.
-// Number(null) is 0 and Number.isFinite(0) is true, which is how unknown
-// episodes ended up persisted and rendered as "S0 E0".
+// Episode numbers must be positive; season zero is reserved for Specials.
+// Null/empty/NaN/negative coordinates remain unknown and must stay NULL.
 function positiveIntOrNull(v) {
   if (v == null || v === "") return null;
   const n = Number(v);
-  return Number.isFinite(n) && Math.trunc(n) > 0 ? Math.trunc(n) : null;
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+function seasonIntOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+function nonNegativeIntOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+function fractionOrZero(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
 }
 
 const RELATION_COLUMNS = "id,user1_id,user2_id,created_at,accepted_at,archived_at,ended_at";
@@ -273,9 +310,9 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
   // no history row is deleted and normalizeEntry retains accumulated watch,
   // together, session and first/last-watched totals. If multiple candidates
   // exist, leave them untouched rather than risk merging remakes/duplicates.
-  const season = positiveIntOrNull(entry.season);
+  const season = seasonIntOrNull(entry.season);
   const episode = positiveIntOrNull(entry.episode);
-  if (season && episode && (entry.metadataProvider && entry.metadataId || entry.metadataYear)) {
+  if (season != null && episode != null && (entry.metadataProvider && entry.metadataId || entry.metadataYear || entry.episodeMetadataId)) {
     let legacyQuery = sb.from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", scope)
       .eq("season", season).eq("episode", episode);
     if (entry.metadataProvider && entry.metadataId) {
@@ -319,7 +356,7 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
     // An existing deployment may not yet have the optional artwork/title columns.
     // Retry only the legacy-compatible fields; anime still correctly requires the
     // existing kind/content_type constraint to permit it.
-    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
+    const modernSchemaError = /column .*?(content_type|canonical_title|artwork|artwork_candidates|backdrop|metadata_provider|metadata_id|metadata_year|episode_title|episode_metadata_provider|episode_metadata_id|episode_numbering_system|absolute_episode_number|media_position_sec|media_duration_sec|story_total_episodes|story_episodes_completed|story_progress|story_progress_confidence|series_episode_counts|together_duration_sec|session_count|completed_at).*?(does not exist|unknown)/i.test(String(error.message || ""));
     if (modernSchemaError) {
       // Every column named in the regex above must be stripped here too —
       // this list previously only dropped the original three (content_type/
@@ -341,6 +378,12 @@ async function upsertEntry(userId, entry, sharedRelationId = null) {
       delete legacyRow.metadata_id;
       delete legacyRow.metadata_year;
       delete legacyRow.episode_title;
+      delete legacyRow.episode_metadata_provider;
+      delete legacyRow.episode_metadata_id;
+      delete legacyRow.episode_numbering_system;
+      delete legacyRow.absolute_episode_number;
+      delete legacyRow.media_position_sec;
+      delete legacyRow.media_duration_sec;
       delete legacyRow.story_total_episodes;
       delete legacyRow.story_episodes_completed;
       delete legacyRow.story_progress;
@@ -933,21 +976,35 @@ function identityPatch(entry, existing) {
   for (const c of TOTAL_COLS) delete p[c];
   return p;
 }
-function normalizeSeriesIdentityTitle(value) {
-  return String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
-    .replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
-}
 function sameEpisodeIdentity(incoming, stored) {
   if (!incoming || !stored) return false;
-  const season = positiveIntOrNull(incoming.season), episode = positiveIntOrNull(incoming.episode);
-  if (!season || !episode || positiveIntOrNull(stored.season) !== season || positiveIntOrNull(stored.episode) !== episode) return false;
+  const iep = String(incoming.episodeMetadataProvider || "").toLowerCase();
+  const iei = String(incoming.episodeMetadataId || "");
+  const sep = String(stored.episodeMetadataProvider || "").toLowerCase();
+  const sei = String(stored.episodeMetadataId || "");
+  // Matching IDs from the same episode provider are decisive. Conflicting
+  // IDs within that namespace must not be merged, but different episode-ID
+  // providers can still describe the same episode; fall back to the shared
+  // authoritative series identity and numbering below.
+  if (iep && iei && sep && sei && iep === sep) return iei === sei;
+  const season = seasonIntOrNull(incoming.season), episode = positiveIntOrNull(incoming.episode);
+  const storedSeason=seasonIntOrNull(stored.season), storedEpisode=positiveIntOrNull(stored.episode);
   const ip = String(incoming.metadataProvider || "").toLowerCase(), ii = String(incoming.metadataId || "");
   const sp = String(stored.metadataProvider || "").toLowerCase(), si = String(stored.metadataId || "");
-  if (ip && ii && sp && si) return ip === sp && ii === si;
-  const iy = Number(incoming.metadataYear), sy = Number(stored.metadataYear);
-  const it = normalizeSeriesIdentityTitle(incoming.canonicalTitle || incoming.title);
-  const st = normalizeSeriesIdentityTitle(stored.canonicalTitle || stored.title);
-  return !!(iy > 0 && iy === sy && it.length >= 3 && it === st);
+  if (ip && ii && sp && si && (ip !== sp || ii !== si)) return false;
+  if (season != null && episode != null && storedSeason === season && storedEpisode === episode) {
+    // Without the same authoritative series provider id, matching title/year
+    // fields are not sufficient to reconcile records safely. Keep uncertain
+    // records separate until better identity is available.
+    if (ip && ii && sp && si) return ip === sp && ii === si;
+    return false;
+  }
+  // Absolute numbering is usable only when explicitly declared on both sides
+  // and tied to the same authoritative series identity.
+  const ia=positiveIntOrNull(incoming.absoluteEpisodeNumber), sa=positiveIntOrNull(stored.absoluteEpisodeNumber);
+  const inum=String(incoming.episodeNumberingSystem||"").toLowerCase(), snum=String(stored.episodeNumberingSystem||"").toLowerCase();
+  return !!(inum === "absolute" && snum === "absolute" && ia && ia === sa
+    && ip && ii && ip === sp && ii === si);
 }
 
 async function ensurePersonalRow(userId, entry, sourceKey) {
@@ -958,12 +1015,36 @@ async function ensurePersonalRow(userId, entry, sourceKey) {
   if (existing) {
     return q(sbx().from("scrapbook_entries").update(identityPatch({ ...entry, sourceKey }, existing)).eq("id", existing.id).select("*").maybeSingle());
   }
-  if (positiveIntOrNull(entry.season) && positiveIntOrNull(entry.episode) && (entry.metadataId && entry.metadataProvider || Number(entry.metadataYear) > 0)) {
-    const { data: candidates, error } = await sbx().from("scrapbook_entries").select("*").eq("user_id", userId).eq("scope", scope)
-      .eq("season", positiveIntOrNull(entry.season)).eq("episode", positiveIntOrNull(entry.episode)).limit(500);
-    if (error) throw error;
-    const matches = (candidates || []).filter(r => r.source_key !== sourceKey && sameEpisodeIdentity(entry, {
+  const hasCoordinates=seasonIntOrNull(entry.season)!=null&&positiveIntOrNull(entry.episode)!=null;
+  const hasEpisodeId=!!(entry.episodeMetadataProvider&&entry.episodeMetadataId);
+  const hasAbsolute=String(entry.episodeNumberingSystem||"").toLowerCase()==="absolute"
+    && positiveIntOrNull(entry.absoluteEpisodeNumber)!=null && entry.metadataProvider && entry.metadataId;
+  if ((hasCoordinates && (entry.metadataId && entry.metadataProvider || Number(entry.metadataYear)>0 || hasEpisodeId))
+      || (!hasCoordinates && hasEpisodeId) || hasAbsolute) {
+    // Search each available authoritative handle. A row may have been saved
+    // before coordinates were recovered, or before an episode-provider id was
+    // available, so a single mutually-exclusive query would miss safe rekeys.
+    const candidateQueries=[];
+    const baseCandidateQuery=()=>sbx().from("scrapbook_entries").select("*").eq("user_id",userId).eq("scope",scope);
+    if (hasEpisodeId) candidateQueries.push(baseCandidateQuery()
+      .eq("episode_metadata_provider",String(entry.episodeMetadataProvider).toLowerCase())
+      .eq("episode_metadata_id",String(entry.episodeMetadataId)).limit(500));
+    if (hasCoordinates) candidateQueries.push(baseCandidateQuery()
+      .eq("season",seasonIntOrNull(entry.season)).eq("episode",positiveIntOrNull(entry.episode)).limit(500));
+    if (hasAbsolute) candidateQueries.push(baseCandidateQuery()
+      .eq("episode_numbering_system","absolute").eq("absolute_episode_number",positiveIntOrNull(entry.absoluteEpisodeNumber))
+      .eq("metadata_provider",entry.metadataProvider).eq("metadata_id",String(entry.metadataId)).limit(500));
+    const candidateResults=await Promise.all(candidateQueries.map(query=>query));
+    const candidateMap=new Map();
+    for (const result of candidateResults) {
+      if (result.error) throw result.error;
+      for (const row of (result.data || [])) candidateMap.set(row.id,row);
+    }
+    const candidates=[...candidateMap.values()];
+    const matches = candidates.filter(r => r.source_key !== sourceKey && sameEpisodeIdentity(entry, {
       metadataProvider:r.metadata_provider, metadataId:r.metadata_id, metadataYear:r.metadata_year,
+      episodeMetadataProvider:r.episode_metadata_provider, episodeMetadataId:r.episode_metadata_id,
+      episodeNumberingSystem:r.episode_numbering_system, absoluteEpisodeNumber:r.absolute_episode_number,
       canonicalTitle:r.canonical_title || r.title, title:r.title, season:r.season, episode:r.episode
     }));
     if (matches.length === 1) {
@@ -988,7 +1069,11 @@ async function ensureSharedMemory(chapterId, entry, sourceKey) {
   const find = () => q(sbx().from("shared_memories").select("*").eq("chapter_id", chapterId).eq("source_key", sourceKey).eq("journey_version", gen).maybeSingle());
   const t = now();
   let mem = await find();
-  if (!mem && positiveIntOrNull(entry.season) && positiveIntOrNull(entry.episode) && (entry.metadataId && entry.metadataProvider || Number(entry.metadataYear) > 0)) {
+  const hasSharedCoordinates=seasonIntOrNull(entry.season)!=null&&positiveIntOrNull(entry.episode)!=null;
+  const hasSharedEpisodeId=!!(entry.episodeMetadataProvider&&entry.episodeMetadataId);
+  const hasSharedAbsolute=String(entry.episodeNumberingSystem||"").toLowerCase()==="absolute"
+    && positiveIntOrNull(entry.absoluteEpisodeNumber)!=null && entry.metadataProvider && entry.metadataId;
+  if (!mem && ((hasSharedCoordinates&&(entry.metadataId&&entry.metadataProvider||Number(entry.metadataYear)>0||hasSharedEpisodeId)) || hasSharedEpisodeId || hasSharedAbsolute)) {
     const { data: candidates, error } = await sbx().from("shared_memories").select("*").eq("chapter_id", chapterId).eq("journey_version", gen).limit(500);
     if (error) throw error;
     const matches = (candidates || []).filter(r => r.source_key !== sourceKey && sameEpisodeIdentity(entry, r.entry || {}));

@@ -28,7 +28,7 @@ function scoreFor(q, name, isSlug) {
   }
   return s;
 }
-function keyFor(q) { return JSON.stringify([q.title || q.canonicalTitle || "", q.type || "", q.year ?? null, q.season ?? null, q.episode ?? null]); }
+function keyFor(q) { return JSON.stringify([q.title || q.canonicalTitle || "", q.type || "", q.year ?? null, q.season ?? null, q.episode ?? null, q.provider || "", q.providerId || "", q.episodeId || "", q.numberingSystem || "", q.absoluteEpisode ?? null]); }
 
 async function tmdb(path) {
   const hit=requestCache.get(path);
@@ -100,7 +100,9 @@ function slugQueries(pathname) {
   return out;
 }
 function queryCandidates(provisional, meta) {
-  const raw = [provisional.canonicalTitle, provisional.title, meta.seriesTitle, meta.title,
+  // Prefer the actual series title. Generic player labels ("Episode", "Episode
+  // 3", "Watch") are never provider search terms and must not beat it.
+  const raw = [meta.seriesTitle, provisional.canonicalTitle, provisional.title, meta.title,
     ...(Array.isArray(meta.titleCandidates) ? meta.titleCandidates : []), ...slugQueries(meta.pathname)];
   const seen = new Set(); const out = []; const slugSet = new Set();
   const slugKeys = new Set(slugQueries(meta.pathname).map(x => normTitle(cleanQuery(x))));
@@ -115,7 +117,7 @@ function queryCandidates(provisional, meta) {
   for (const r of expanded) {
     const q = cleanQuery(r);
     const k = normTitle(q);
-    if (!q || q.length < 3 || !k || seen.has(k)) continue;
+    if (!q || q.length < 3 || /^(?:episode(?:\s*\d+)?|watch|video|player|stream|untitled)$/i.test(q) || !k || seen.has(k)) continue;
     seen.add(k); out.push(q);
     if (slugKeys.has(k)) slugSet.add(q);
     if (out.length >= 8) break;
@@ -131,9 +133,14 @@ async function resolveUncached(input = {}) {
   const eHint = provisional.episode ?? meta.episode;
   const yearHint = Number(provisional.metadataYear ?? meta.metadataYear ?? meta.seriesYear) || null;
   const queries = queryCandidates(provisional, meta);
-  if (!queries.length) return null;
-  let rawTitle = queries[0];
-  const key = keyFor({ title: queries.join("|"), type: provisional.contentType, year: yearHint, season: sHint, episode: eHint });
+  const knownProvider=String(provisional.metadataProvider || meta.metadataProvider || "").toLowerCase();
+  const knownProviderId=String(provisional.metadataId || meta.metadataId || "");
+  // This resolver only speaks TMDB. Never overwrite another provider's
+  // authoritative identifier with a title-only TMDB guess.
+  if (knownProvider && knownProvider !== "tmdb") return null;
+  if (!queries.length && !(knownProvider === "tmdb" && /^[1-9]\d*$/.test(knownProviderId))) return null;
+  let rawTitle = queries[0] || "";
+  const key = keyFor({ title: queries.join("|"), type: provisional.contentType || meta.contentType, year: yearHint, season: sHint, episode: eHint, provider:knownProvider, providerId:knownProviderId, episodeId:meta.episodeMetadataId || provisional.episodeMetadataId, numberingSystem:meta.episodeNumberingSystem || provisional.episodeNumberingSystem, absoluteEpisode:meta.absoluteEpisodeNumber || provisional.absoluteEpisodeNumber });
   const hit = cache.get(key); if (hit && Date.now() - hit.at < CACHE_MS) return hit.value;
 
   // When the classifier had no title to work with (identity only in slug /
@@ -142,13 +149,33 @@ async function resolveUncached(input = {}) {
   const animeHint = /\/anime(?:\/|$)/i.test(String(meta.pathname || "")) || (Array.isArray(meta.typeHints) ? meta.typeHints : []).some(h => /^anime$/i.test(String(h)));
   const wantsAnime = provisional.contentType === "anime" || (!provisional.contentType && animeHint);
   const preferred = wantsAnime ? "tv" : provisional.contentType;
-  const isEpisode = Number(eHint)>0 || Number(sHint)>0;
+  const seasonHintValid=sHint != null && sHint !== "" && Number.isInteger(Number(sHint)) && Number(sHint) >= 0;
+  const episodeHintValid=eHint != null && eHint !== "" && Number.isInteger(Number(eHint)) && Number(eHint) > 0;
+  const typeHints=Array.isArray(meta.typeHints)?meta.typeHints.map(x=>String(x).toLowerCase()):[];
+  const seriesEvidence=!!String(meta.seriesTitle||"").trim() || seasonHintValid&&episodeHintValid || typeHints.some(x=>/tvseries|tvepisode|series/.test(x));
+  const isEpisode = episodeHintValid || seasonHintValid;
   let selected = null;
   let contentType = null;
+  let preloadedDetails = null;
+  // A known TMDB series id is authoritative. Resolve it directly rather than
+  // searching by a possibly generic or localized page title.
+  if (knownProvider === "tmdb" && /^[1-9]\d*$/.test(knownProviderId)) {
+    let knownType=provisional.contentType || meta.contentType;
+    knownType=knownType==='anime'?'series':knownType;
+    if (knownType==='series') knownType='tv';
+    if (knownType!=='movie' && knownType!=='tv') knownType=seriesEvidence?'tv':null;
+    if (knownType) {
+      preloadedDetails=await tmdb(`/${knownType}/${knownProviderId}?language=en-US`);
+      if (preloadedDetails && String(preloadedDetails.id)===knownProviderId) {
+        selected={id:knownProviderId};
+        contentType=knownType==='tv'?(wantsAnime?'anime':'series'):'movie';
+      }
+    }
+  }
   // The page may expose the real title in ANY of several fields (h1, JSON-LD,
   // slug, player title). Try each cleaned query in priority order and stop at
   // the first confident TMDB match, instead of betting on a single field.
-  for (const q of queries) {
+  for (const q of (selected ? [] : queries)) {
     const [movieData,tvData]=await Promise.all([
       preferred === "tv" ? null : tmdb(`/search/movie?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`),
       preferred === "movie" ? null : tmdb(`/search/tv?query=${encodeURIComponent(q)}&include_adult=false&language=en-US&page=1`)]);
@@ -175,16 +202,16 @@ async function resolveUncached(input = {}) {
   }
   if (!selected || !contentType) return null;
 
-  let details = null;
+  let details = preloadedDetails || null;
   let seriesEpisodeCounts = null;
   let storyTotalEpisodes = 0;
   let storyEpisodesCompleted = 0;
   let storyProgress = null;
   let storyProgressConfidence = null;
   if (contentType === "movie") {
-    details = await tmdb(`/movie/${selected.id}?language=en-US`);
+    if (!details) details = await tmdb(`/movie/${selected.id}?language=en-US`);
   } else {
-    details = await tmdb(`/tv/${selected.id}?language=en-US`);
+    if (!details) details = await tmdb(`/tv/${selected.id}?language=en-US`);
     if (details?.number_of_seasons) {
       seriesEpisodeCounts = await seasonCounts(selected.id, details.number_of_seasons,details.seasons);
       storyTotalEpisodes = Object.values(seriesEpisodeCounts).reduce((a,b)=>a+b,0);
@@ -199,15 +226,18 @@ async function resolveUncached(input = {}) {
   // season+episode. TMDB is authoritative here, so this is the most reliable
   // episode-title source we have; a miss simply leaves it null and the UI
   // falls back to "Episode N" rather than guessing from the page title.
-  let episodeTitle = null;
+  let episodeTitle = null, episodeMetadataId = null, episodeRuntimeSec = null;
   if (contentType !== "movie") {
-    const sNum = Number(provisional.season ?? meta.season);
-    const eNum = Number(provisional.episode ?? meta.episode);
-    if (Number.isInteger(sNum) && sNum > 0 && Number.isInteger(eNum) && eNum > 0) {
+    const sNum = seasonHintValid ? Number(sHint) : null;
+    const eNum = episodeHintValid ? Number(eHint) : null;
+    if (sNum != null && eNum != null) {
       const ep = await tmdb(`/tv/${selected.id}/season/${sNum}/episode/${eNum}?language=en-US`);
       const epName = clean(ep?.name || "");
-      // TMDB returns a placeholder like "Episode 5" when it has no real title.
-      if (epName && !/^episode\s*\d+$/i.test(epName)) episodeTitle = epName;
+      // A provider episode id is stronger than episode title + coordinates.
+      if (ep?.id != null) episodeMetadataId=String(ep.id);
+      if (ep?.runtime != null && Number(ep.runtime)>0) episodeRuntimeSec=Math.round(Number(ep.runtime)*60);
+      // TMDB returns generic placeholders when it lacks a real episode title.
+      if (epName && !/^episode(?:\s*\d+)?$/i.test(epName)) episodeTitle = epName;
     }
   }
 
@@ -224,9 +254,14 @@ async function resolveUncached(input = {}) {
     title: contentType === "movie" ? clean(details?.title || selected.title || rawTitle) : clean(details?.name || selected.name || rawTitle),
     canonicalTitle: contentType === "movie" ? clean(details?.title || selected.title || rawTitle) : clean(details?.name || selected.name || rawTitle),
     contentType,
-    season: Number.isInteger(Number(provisional.season ?? meta.season)) ? Number(provisional.season ?? meta.season) : null,
-    episode: Number.isInteger(Number(provisional.episode ?? meta.episode)) ? Number(provisional.episode ?? meta.episode) : null,
+    season: seasonHintValid ? Number(sHint) : null,
+    episode: episodeHintValid ? Number(eHint) : null,
     episodeTitle,
+    episodeMetadataProvider: episodeMetadataId ? "tmdb" : (meta.episodeMetadataProvider || provisional.episodeMetadataProvider || ""),
+    episodeMetadataId: episodeMetadataId || meta.episodeMetadataId || provisional.episodeMetadataId || "",
+    episodeNumberingSystem: meta.episodeNumberingSystem || provisional.episodeNumberingSystem || "",
+    absoluteEpisodeNumber: Number.isInteger(Number(meta.absoluteEpisodeNumber ?? provisional.absoluteEpisodeNumber)) && Number(meta.absoluteEpisodeNumber ?? provisional.absoluteEpisodeNumber)>0 ? Number(meta.absoluteEpisodeNumber ?? provisional.absoluteEpisodeNumber) : null,
+    episodeRuntimeSec,
     artwork: artworkCandidates[0] || null,
     backdrop: image(details?.backdrop_path || selected.backdrop_path, "w1280"),
     artworkCandidates: artworkCandidates.slice(0, 10),
@@ -273,7 +308,7 @@ async function recoverArtwork(entry={}) {
   // Cards use the series poster/backdrop, not a fabricated episode portrait.
   // Confirm a numbered episode exists before attaching show assets to it.
   if(type==='tv'&&entry.season!=null&&entry.episode!=null){
-    if(!(Number(entry.season)>0&&Number(entry.episode)>0))return {artwork:null,backdrop:null};
+    if(!(Number.isInteger(Number(entry.season))&&Number(entry.season)>=0&&Number(entry.episode)>0))return {artwork:null,backdrop:null};
     const ep=await tmdb(`/tv/${id}/season/${Number(entry.season)}/episode/${Number(entry.episode)}?language=en-US`);
     if(!ep)return {artwork:null,backdrop:null,transient:true};
   }

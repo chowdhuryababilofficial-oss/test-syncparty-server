@@ -81,6 +81,12 @@ create table if not exists public.scrapbook_entries (
   season integer,
   episode integer,
   episode_title text,
+  episode_metadata_provider text not null default '',
+  episode_metadata_id text not null default '',
+  episode_numbering_system text not null default '',
+  absolute_episode_number integer,
+  media_position_sec bigint,
+  media_duration_sec bigint,
   story_total_episodes integer not null default 0,
   story_episodes_completed integer not null default 0,
   story_progress numeric(5,4),
@@ -130,6 +136,12 @@ alter table public.scrapbook_entries add column if not exists episode integer;
 -- source exists (JSON-LD TVEpisode name, or the TMDB episode name). NULL
 -- means "unknown", and the UI shows "Episode N" rather than guessing.
 alter table public.scrapbook_entries add column if not exists episode_title text;
+alter table public.scrapbook_entries add column if not exists episode_metadata_provider text not null default '';
+alter table public.scrapbook_entries add column if not exists episode_metadata_id text not null default '';
+alter table public.scrapbook_entries add column if not exists episode_numbering_system text not null default '';
+alter table public.scrapbook_entries add column if not exists absolute_episode_number integer;
+alter table public.scrapbook_entries add column if not exists media_position_sec bigint;
+alter table public.scrapbook_entries add column if not exists media_duration_sec bigint;
 alter table public.scrapbook_entries add column if not exists story_total_episodes integer not null default 0;
 alter table public.scrapbook_entries add column if not exists story_episodes_completed integer not null default 0;
 alter table public.scrapbook_entries add column if not exists story_progress numeric(5,4);
