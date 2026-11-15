@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity, getAccountPreferences, setQuickReactions, markNotificationsRead } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
+const { signHighlightMessage } = require("./highlight-proof");
 
 // Scrapbook maintenance (purge of removed memories past their 30-day restore
 // window, removal-request expiry, ledger compaction): on boot, every 6 hours
@@ -404,6 +405,29 @@ const httpServer = http.createServer(async (req, res) => {
       json(res,200,await scrapbook.markMomentsSeen(user.id,b.momentIds)); return;
     }
 
+    // Scene Highlights are distinct from the legacy /highlights summary above.
+    // The /records path lists actual private/shared capture records; every query
+    // is scoped by the authenticated owner or their existing relation rows.
+    if (path === "/api/scrapbook/highlights/records" && req.method === "GET") {
+      const user=await requireUser(req,res); if(!user)return;
+      const scope=u.searchParams.get("scope")==="shared"?"shared":"personal";
+      json(res,200,{ok:true,highlights:await scrapbook.listHighlights(user.id,scope)});return;
+    }
+    if (path === "/api/scrapbook/highlights" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.createHighlight(user.id,b.highlight||b);
+      json(res,200,{ok:true,persisted:true,duplicate:!!result.duplicate,highlight:result.highlight});return;
+    }
+    if (path === "/api/scrapbook/highlights/share" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      const result=await scrapbook.shareHighlight(user.id,b.highlightId);
+      if(result.error){json(res,result.status||400,{ok:false,error:result.error});return;}
+      json(res,200,{ok:true,...result});return;
+    }
+    if (path === "/api/scrapbook/highlights/remove" && req.method === "POST") {
+      const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
+      json(res,200,{ok:true,...await scrapbook.removeHighlight(user.id,b.highlightId)});return;
+    }
     if (path === "/api/scrapbook/highlights" && req.method === "GET") {
       const user=await requireUser(req,res); if(!user)return;
       json(res,200,{ok:true,highlights:await scrapbook.getHighlights(user.id)});return;
@@ -414,7 +438,8 @@ const httpServer = http.createServer(async (req, res) => {
     // Preserve the request ID and effective HTTP result in the sanitized log
     // so a client retry can be correlated with a committed/failed write.
     const httpStatus = e && ['SP_LOCK_TIMEOUT','SP_FENCED','SP_SCHEMA_MISSING'].includes(e.code) ? 503
-      : e && ['SPV01','SPC01','SPR01'].includes(e.code) ? 409 : 500;
+      : e && ['SPV01','SPC01','SPR01'].includes(e.code) ? 409
+      : Number.isInteger(e?.status) && e.status >= 400 && e.status < 500 ? e.status : 500;
     console.error('[SyncParty Scrapbook API]',{
       requestId:req.spRequestId||null,operation:`${req.method} ${String(req.url||'').split('?')[0]}`,httpStatus,
       code:String(e?.code||e?.status||'INTERNAL').slice(0,60),
@@ -423,7 +448,8 @@ const httpServer = http.createServer(async (req, res) => {
     });
     // Scrapbook v2: a lock wait that timed out, a lock that moved to another
     // server (fenced) or missing 9.7/9.8 functions are retryable 503s; a
-    // transition the database refused (SPV01/SPC01/SPR01) is a 409.
+    // transition the database refused (SPV01/SPC01/SPR01) is a 409. Store-level
+    // validation/consent failures retain their explicit 4xx status.
     if (httpStatus === 503) { json(res,503,{ok:false,error:e.message,retryable:true,requestId:req.spRequestId}); return; }
     if (httpStatus === 409) { json(res,409,{ok:false,error:'This Scrapbook change is no longer possible; refresh and try again.',requestId:req.spRequestId}); return; }
     const message = process.env.NODE_ENV === 'production' ? 'SyncParty server error.' : (e?.message || 'SyncParty server error.');
@@ -471,7 +497,8 @@ function transitionPeerRecord(s) {
     accountId: s.profile?.accountId || null,
     name: s.profile?.name || "Guest",
     avatar: s.profile?.avatar || "🙂",
-    color: s.profile?.color || "#54a0ff"
+    color: s.profile?.color || "#54a0ff",
+    highlightConsent: s.highlightConsent === true
   };
 }
 // --- presence grace ----------------------------------------------------------
@@ -914,6 +941,7 @@ wss.on("connection", ws => {
       s.pageKey = String(m.pageKey || "");
       s.pageUrl = normalizeUrl(m.pageUrl);
       s.profile = sanitizeProfile(m.profile);
+      s.highlightConsent = m.highlightConsent === true;
       s.syncProtocol = Number(m.syncProtocol) || 1;
       const playback = playbackFor(room,s.syncProtocol >= 2);
       if (playback) {
@@ -972,10 +1000,15 @@ wss.on("connection", ws => {
       if (kind === "peer-connection") return;
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state", "highlight-consent"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
       if ((kind === "sync" || kind === "buffering") && handlePlaybackMessage(ws,s,p)) return;
+      if (kind === "highlight-consent") {
+        s.highlightConsent = p.enabled === true;
+        broadcastPeers(s.room);
+        return;
+      }
 
       if (kind === "navigate") {
         const target = normalizeUrl(p.url);
@@ -1007,19 +1040,34 @@ wss.on("connection", ws => {
       const profile = sanitizeProfile(p);
       if (kind === "profile" || kind === "presence" || kind === "chat" || kind === "sticker") s.profile = profile;
 
-      broadcast(s.room, {
-        type: "message",
-        payload: {
-          ...p,
-          ...(kind === "system" ? {presenceEvent:undefined,eventId:undefined} : {}),
-          transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
-          url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
-          id: s.clientId || s.id,
-          name: profile.name,
-          avatar: profile.avatar,
-          color: profile.color
-        }
-      }, ws);
+      const outgoingPayload = {
+        ...p,
+        ...(kind === "chat" ? {
+          // Author and consent are relay-owned. A client cannot claim another
+          // participant's identity or opt-in state. The relay signs eligible
+          // messages so a later Highlights API request cannot forge consent.
+          authorId: s.clientId || s.id,
+          authorAccountId: s.profile?.accountId || null,
+          highlightConsent: s.highlightConsent === true,
+          // Never disclose the playback position to the room unless the author
+          // opted in, even if a modified client sends an unsolicited snapshot.
+          mediaSnapshot: s.highlightConsent === true ? p.mediaSnapshot || null : null,
+          // Relay receive time is authoritative for chat ordering.
+          sentAt: Date.now(),
+          highlightRoom: s.room
+        } : {}),
+        ...(kind === "system" ? {presenceEvent:undefined,eventId:undefined} : {}),
+        transitionId: kind === "navigate" ? activeTransition(s.room)?.id : p.transitionId,
+        url: kind === "navigate" ? normalizeUrl(p.url) : p.url,
+        id: s.clientId || s.id,
+        name: profile.name,
+        avatar: profile.avatar,
+        color: profile.color
+      };
+      if (kind === "chat" && outgoingPayload.highlightConsent) {
+        outgoingPayload.highlightProof = signHighlightMessage(outgoingPayload);
+      }
+      broadcast(s.room, { type: "message", payload: outgoingPayload }, kind === "chat" ? null : ws);
 
       if (kind === "profile" || kind === "presence") broadcastPeers(s.room);
       return;

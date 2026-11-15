@@ -1,0 +1,67 @@
+const assert = require('assert');
+process.env.HIGHLIGHT_SIGNING_SECRET = 'test-only-highlight-secret';
+const fake = require('./fake-supabase');
+const supabasePath = require.resolve('../supabase');
+require.cache[supabasePath] = { id:supabasePath, filename:supabasePath, loaded:true, exports:fake };
+for (const name of ['../auth-store','../scrapbook-store']) delete require.cache[require.resolve(name)];
+const { signHighlightMessage, verifyHighlightMessage } = require('../highlight-proof');
+const store = require('../scrapbook-store');
+function makeMessage(messageId='message-1', authorId='member-a') {
+  const mediaSnapshot = { mediaId:'got-s3e9', sourceKey:'got-s3e9', title:'Game of Thrones', platform:'netflix', season:3, episode:9, positionSeconds:2536, durationSeconds:3500, artwork:null, sourceUrl:'https://www.netflix.com/title/123' };
+  const m = { messageId, authorId, authorAccountId:authorId==='member-a'?'user-a':'user-b', name:authorId==='member-a'?'Alex':'Maya', avatar:'🙂', color:'#8877aa', authorName:authorId==='member-a'?'Alex':'Maya', authorAvatar:'🙂', authorColor:'#8877aa', sentAt:Date.now(), text:'This is getting interesting!', replyTo:null, mediaSnapshot, highlightRoom:'ROOM01', highlightConsent:true, positionSeconds:2536, mediaId:'got-s3e9', reactions:{'😂':1} };
+  m.highlightProof=signHighlightMessage(m); return m;
+}
+function makeHighlight(requestId='hl_123456789abc') {
+  const message=makeMessage(); message.segmentIndex=0;
+  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], messages:[message] };
+}
+(async()=>{
+  fake.reset();
+  const signed=makeMessage();
+  assert.strictEqual(verifyHighlightMessage(signed),true,'relay signature verifies for the original payload');
+  assert.strictEqual(verifyHighlightMessage({...signed,text:'tampered message'}),false,'relay signature rejects tampered message text');
+  assert.strictEqual(verifyHighlightMessage({...signed,mediaSnapshot:{...signed.mediaSnapshot,positionSeconds:999}}),false,'relay signature rejects tampered playback position');
+  const forged=makeHighlight('hl_forged12345'); forged.messages[0].highlightProof='v1.forged';
+  assert.throws(()=>store.normalizeHighlightRecord(forged),/valid relay-issued/,'forged opt-in is rejected');
+  const mixedMedia=makeHighlight('hl_mixedmedia123');
+  const otherMediaMessage=makeMessage('message-2');
+  otherMediaMessage.mediaSnapshot={...otherMediaMessage.mediaSnapshot,mediaId:'different-episode',sourceKey:'different-episode'};
+  otherMediaMessage.highlightProof=signHighlightMessage(otherMediaMessage);
+  mixedMedia.messages.push(otherMediaMessage);
+  assert.throws(()=>store.normalizeHighlightRecord(mixedMedia),/different media identity/,'server rejects signed messages from another title');
+  const mixedRoom=makeHighlight('hl_mixedroom123');
+  const otherRoomMessage=makeMessage('message-3'); otherRoomMessage.highlightRoom='ROOM02'; otherRoomMessage.highlightProof=signHighlightMessage(otherRoomMessage);
+  mixedRoom.messages.push(otherRoomMessage);
+  assert.throws(()=>store.normalizeHighlightRecord(mixedRoom),/different rooms/,'server rejects messages from another room');
+  const mismatchedPosition=makeHighlight('hl_badposition123'); mismatchedPosition.messages[0].positionSeconds=2600;
+  assert.throws(()=>store.normalizeHighlightRecord(mismatchedPosition),/inconsistent playback timestamp/,'server rejects a modified playback timestamp');
+  const missingPosition=makeHighlight('hl_missingtime123');
+  missingPosition.messages[0].positionSeconds=null;
+  missingPosition.messages[0].mediaSnapshot={...missingPosition.messages[0].mediaSnapshot,positionSeconds:null};
+  missingPosition.messages[0].highlightProof=signHighlightMessage(missingPosition.messages[0]);
+  assert.throws(()=>store.normalizeHighlightRecord(missingPosition),/inconsistent playback timestamp/,'server does not reinterpret missing timestamps as zero');
+  const unknownSeason=makeHighlight('hl_unknownseason123'); unknownSeason.media.season=null;
+  assert.strictEqual(store.normalizeHighlightRecord(unknownSeason).media.season,null,'unknown season stays unknown');
+  const specialSeason=makeHighlight('hl_specialseason123'); specialSeason.media.season=0;
+  assert.strictEqual(store.normalizeHighlightRecord(specialSeason).media.season,0,'season zero remains a valid Specials season');
+  const input=makeHighlight();
+  const first=await store.createHighlight('user-a',input);
+  assert.strictEqual(first.duplicate,false);
+  const retry=await store.createHighlight('user-a',input);
+  assert.strictEqual(retry.duplicate,true,'idempotent request returns original record');
+  assert.strictEqual((await store.listHighlights('user-a','personal')).length,1);
+  assert.strictEqual((await store.listHighlights('user-b','personal')).length,0,'private record is not visible to another account');
+  fake.tables.relations.push({id:'rel-a-b',user1_id:'user-a',user2_id:'user-b',created_at:Date.now(),accepted_at:Date.now(),archived_at:null,ended_at:null});
+  const shared=await store.shareHighlight('user-a',first.highlight.id);
+  assert.strictEqual(shared.ok,true);
+  assert.strictEqual(shared.highlight.scope,'shared');
+  assert.strictEqual((await store.listHighlights('user-a','personal')).length,1,'sharing preserves the personal copy');
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length,1,'active relationship partner can read explicitly shared Highlight');
+  const sharedRetry=await store.shareHighlight('user-a',first.highlight.id);
+  assert.strictEqual(sharedRetry.duplicate,true,'repeated share does not create a second shared record');
+  const deleted=await store.removeHighlight('user-a',shared.highlight.id);
+  assert.strictEqual(deleted.removed,true);
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length,0,'deleting the shared copy removes it from the shared listing');
+  assert.strictEqual((await store.listHighlights('user-a','personal')).length,1,'deleting the shared copy does not delete the personal Highlight');
+  console.log('Highlights store tests: PASS (forged consent, idempotency, private ownership, explicit share, soft delete)');
+})().catch(error=>{console.error(error);process.exitCode=1;});

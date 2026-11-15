@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const { getSupabaseAdmin } = require("./supabase");
 const { publicUser } = require("./auth-store");
+const { verifyHighlightMessage } = require("./highlight-proof");
 
 function id(prefix = "id") {
   return `${prefix}_${crypto.randomBytes(9).toString("hex")}`;
@@ -666,6 +667,193 @@ async function removeEntries(userId, entryIds) {
   const keys = [...new Set((data || []).filter(r => scopeGeneration(r.scope) != null).map(r => journeyKeyOf(rowToEntry(r))))];
   for (const journeyKey of keys) await journeyAction(userId, { space: "personal", journeyKey, action: "remove" });
   return { removed: (data || []).length, soft: true };
+}
+
+// ---------------------------------------------------------------------------
+// Highlights: private scene/conversation records. Kept separate from
+// scrapbook_entries (which represent watched titles) and from generated
+// Memory Moments. All access is owner- or relationship-checked by this store.
+// ---------------------------------------------------------------------------
+const HIGHLIGHT_MAX_MESSAGES = 120;
+const HIGHLIGHT_MAX_SEGMENTS = 24;
+function highlightText(value, max = 300) {
+  return String(value == null ? "" : value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, max);
+}
+function highlightNumber(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n * 1000) / 1000 : null;
+}
+function normalizeHighlightRecord(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw Object.assign(new Error("Invalid Highlight."), { status: 400 });
+  const requestId = highlightText(input.requestId, 100);
+  if (!/^hl_[A-Za-z0-9_-]{8,96}$/.test(requestId)) throw Object.assign(new Error("A valid Highlight request ID is required."), { status: 400 });
+  const mediaIn = input.media && typeof input.media === "object" ? input.media : {};
+  const mediaId = highlightText(mediaIn.mediaId || mediaIn.sourceKey, 240);
+  const title = highlightText(mediaIn.title, 240).trim();
+  if (!mediaId || !title) throw Object.assign(new Error("Highlight media identity is incomplete."), { status: 400 });
+  let sourceUrl = null;
+  try {
+    const u = new URL(String(mediaIn.sourceUrl || ""));
+    if (u.protocol === "https:" || u.protocol === "http:") {
+      for (const key of [...u.searchParams.keys()]) if (/(token|auth|session|signature|sig|password|secret|key)/i.test(key)) u.searchParams.delete(key);
+      sourceUrl = u.toString().slice(0, 2000);
+    }
+  } catch {}
+  const segmentsInput = Array.isArray(input.segments) ? input.segments : [];
+  if (segmentsInput.length > HIGHLIGHT_MAX_SEGMENTS) throw Object.assign(new Error(`A Highlight cannot contain more than ${HIGHLIGHT_MAX_SEGMENTS} playback segments.`), { status: 413 });
+  const segmentsIn = segmentsInput;
+  if (!segmentsIn.length) throw Object.assign(new Error("At least one playback segment is required."), { status: 400 });
+  const segments = segmentsIn.map((seg, index) => {
+    const startSeconds = highlightNumber(seg?.startSeconds);
+    const endSeconds = highlightNumber(seg?.endSeconds);
+    if (startSeconds == null || endSeconds == null || endSeconds < startSeconds) throw Object.assign(new Error(`Playback segment ${index + 1} has an invalid timestamp range.`), { status: 400 });
+    const segmentMediaId = highlightText(seg?.mediaId || mediaId, 240);
+    if (segmentMediaId !== mediaId) throw Object.assign(new Error("A Highlight cannot combine different media identities."), { status: 400 });
+    return { mediaId, startSeconds, endSeconds, startedAt: Math.max(0, Number(seg.startedAt) || 0), endedAt: Math.max(0, Number(seg.endedAt) || 0) };
+  });
+  const messagesInput = Array.isArray(input.messages) ? input.messages : [];
+  if (messagesInput.length > HIGHLIGHT_MAX_MESSAGES) throw Object.assign(new Error(`A Highlight cannot contain more than ${HIGHLIGHT_MAX_MESSAGES} messages.`), { status: 413 });
+  const messagesIn = messagesInput;
+  if (!messagesIn.length) throw Object.assign(new Error("A Highlight must contain at least one eligible chat message."), { status: 400 });
+  let captureRoom = null;
+  const messages = messagesIn.map((m, index) => {
+    if (!m || typeof m !== "object" || m.highlightConsent !== true || !verifyHighlightMessage(m)) throw Object.assign(new Error(`Message ${index + 1} has no valid relay-issued Highlight consent proof.`), { status: 403 });
+    const messageMediaId = highlightText(m.mediaSnapshot?.mediaId || m.mediaSnapshot?.sourceKey, 240);
+    const messageRoom = highlightText(m.highlightRoom, 80);
+    if (!messageMediaId || messageMediaId !== mediaId) throw Object.assign(new Error(`Message ${index + 1} belongs to a different media identity.`), { status: 400 });
+    if (!messageRoom) throw Object.assign(new Error(`Message ${index + 1} has no room identity.`), { status: 400 });
+    if (captureRoom == null) captureRoom = messageRoom;
+    else if (captureRoom !== messageRoom) throw Object.assign(new Error("A Highlight cannot combine chat messages from different rooms."), { status: 400 });
+    const messageId = highlightText(m.messageId, 128);
+    const authorId = highlightText(m.authorId, 128);
+    const text = highlightText(m.text, 300);
+    if (!messageId || !authorId || !text) throw Object.assign(new Error(`Message ${index + 1} is incomplete.`), { status: 400 });
+    const positionSeconds = highlightNumber(m.positionSeconds);
+    const snapshotPosition = highlightNumber(m.mediaSnapshot?.positionSeconds);
+    if (positionSeconds == null || snapshotPosition == null || Math.abs(positionSeconds - snapshotPosition) > 0.01) {
+      throw Object.assign(new Error(`Message ${index + 1} has inconsistent playback timestamp metadata.`), { status: 400 });
+    }
+    const segmentIndex = Number.isInteger(m.segmentIndex) && m.segmentIndex >= 0 ? m.segmentIndex : (segments.length === 1 && m.segmentIndex == null ? 0 : null);
+    if (segmentIndex == null) throw Object.assign(new Error(`Message ${index + 1} has no valid playback segment assignment.`), { status: 400 });
+    const segment = segments[segmentIndex];
+    if (!segment || positionSeconds < segment.startSeconds - 3 || positionSeconds > segment.endSeconds + 3) {
+      throw Object.assign(new Error(`Message ${index + 1} falls outside its saved playback segment.`), { status: 400 });
+    }
+    const reply = m.replyTo && typeof m.replyTo === "object" ? {
+      id: highlightText(m.replyTo.id, 128),
+      name: highlightText(m.replyTo.name, 24),
+      text: highlightText(m.replyTo.text, 300)
+    } : null;
+    const reactions = {};
+    if (m.reactions && typeof m.reactions === "object" && !Array.isArray(m.reactions)) {
+      for (const [key, value] of Object.entries(m.reactions).slice(0, 24)) {
+        const count = Math.max(0, Math.min(999, Math.round(Number(value) || 0)));
+        if (count) reactions[highlightText(key, 64)] = count;
+      }
+    }
+    return {
+      messageId, authorId,
+      authorAccountId: highlightText(m.authorAccountId, 128) || null,
+      authorName: highlightText(m.authorName, 24) || "Guest",
+      authorAvatar: highlightText(m.authorAvatar, 8) || "🙂",
+      authorColor: /^#[0-9a-f]{3,8}$/i.test(String(m.authorColor || "")) ? String(m.authorColor) : "#54a0ff",
+      text, sentAt: Math.max(0, Number(m.sentAt) || 0),
+      positionSeconds,
+      segmentIndex,
+      highlightConsent: true, replyTo: reply, reactions
+    };
+  });
+  const createdAt = Math.max(0, Number(input.createdAt) || now());
+  return {
+    requestId,
+    title: highlightText(input.title, 100).trim() || title,
+    note: highlightText(input.note, 1000),
+    media: {
+      mediaId, sourceKey: mediaId, title,
+      platform: highlightText(mediaIn.platform, 80),
+      season: mediaIn.season != null && String(mediaIn.season).trim() !== "" && Number.isInteger(Number(mediaIn.season)) && Number(mediaIn.season) >= 0 ? Number(mediaIn.season) : null,
+      episode: Number.isInteger(Number(mediaIn.episode)) && Number(mediaIn.episode) > 0 ? Number(mediaIn.episode) : null,
+      artwork: /^https:\/\/[^\s/]+\//i.test(String(mediaIn.artwork || "")) ? String(mediaIn.artwork).slice(0, 1000) : null,
+      sourceUrl
+    },
+    segments, messages, createdAt,
+    captureMode: input.captureMode === "ongoing" ? "ongoing" : "historical"
+  };
+}
+function highlightRowView(row) {
+  return {
+    id: row.id, ownerId: row.user_id, scope: row.scope, relationId: row.relation_id || null,
+    requestId: row.request_id, data: row.data || {}, createdAt: Number(row.created_at || 0), updatedAt: Number(row.updated_at || 0)
+  };
+}
+async function createHighlight(userId, input) {
+  const record = normalizeHighlightRecord(input);
+  const sb = getSupabaseAdmin();
+  const existing = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", record.requestId).maybeSingle());
+  if (existing) return { highlight: highlightRowView(existing), duplicate: true };
+  const t = now();
+  const row = {
+    id: id("hl"), user_id: String(userId), scope: "personal", relation_id: null,
+    request_id: record.requestId, data: record, created_at: t, updated_at: t, deleted_at: null
+  };
+  const { data, error } = await sb.from("scrapbook_highlights").insert(row).select("*").single();
+  if (error) {
+    // A concurrent retry can win the unique (user_id, request_id) insert.
+    if (String(error.code) === "23505") {
+      const retry = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", record.requestId).maybeSingle());
+      if (retry) return { highlight: highlightRowView(retry), duplicate: true };
+    }
+    throw error;
+  }
+  return { highlight: highlightRowView(data), duplicate: false };
+}
+async function listHighlights(userId, scope = "personal") {
+  const sb = getSupabaseAdmin();
+  let query = sb.from("scrapbook_highlights").select("*").eq("scope", scope).is("deleted_at", null);
+  if (scope === "personal") query = query.eq("user_id", String(userId));
+  else {
+    const { data: relations, error: relationError } = await sb.from("relations").select("id").or(`user1_id.eq.${String(userId)},user2_id.eq.${String(userId)}`);
+    if (relationError) throw relationError;
+    const relationIds = (relations || []).map(r => String(r.id)).filter(Boolean);
+    if (!relationIds.length) return [];
+    query = query.in("relation_id", relationIds);
+  }
+  const { data, error } = await query.order("created_at", { ascending: false }).limit(200);
+  if (error) throw error;
+  return (data || []).map(highlightRowView);
+}
+async function shareHighlight(userId, highlightId) {
+  const sb = getSupabaseAdmin();
+  const row = await q(sb.from("scrapbook_highlights").select("*").eq("id", String(highlightId)).eq("user_id", String(userId)).eq("scope", "personal").is("deleted_at", null).maybeSingle());
+  if (!row) return { ok: false, status: 404, error: "Personal Highlight not found." };
+  const relation = await getActiveRelationRow(userId);
+  if (!relation || !isActiveRelationRow(relation)) return { ok: false, status: 409, error: "An active Our Story is required to share a Highlight." };
+  // Sharing creates a separate Our Story copy. The owner's personal Highlight
+  // remains intact, matching the existing Scrapbook personal/shared model.
+  const sharedRequestId = "hl_share_" + crypto.createHash("sha256").update(`${userId}|${row.request_id}|${relation.id}`).digest("hex").slice(0, 48);
+  const existing = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", sharedRequestId).is("deleted_at", null).maybeSingle());
+  if (existing) return { ok: true, duplicate: true, highlight: highlightRowView(existing) };
+  const t = now();
+  const copy = { id:id("hl"), user_id:String(userId), scope:"shared", relation_id:relation.id,
+    request_id:sharedRequestId, data:{ ...(row.data || {}), sharedFromRequestId:row.request_id },
+    created_at:t, updated_at:t, deleted_at:null };
+  const { data, error } = await sb.from("scrapbook_highlights").insert(copy).select("*").single();
+  if (error) {
+    if (String(error.code) === "23505") {
+      const retry = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", sharedRequestId).maybeSingle());
+      if (retry) return { ok:true, duplicate:true, highlight:highlightRowView(retry) };
+    }
+    throw error;
+  }
+  return { ok:true, duplicate:false, highlight:highlightRowView(data) };
+}
+async function removeHighlight(userId, highlightId) {
+  const sb = getSupabaseAdmin();
+  const t = now();
+  const { data, error } = await sb.from("scrapbook_highlights").update({ deleted_at: t, updated_at: t }).eq("id", String(highlightId)).eq("user_id", String(userId)).is("deleted_at", null).select("id");
+  if (error) throw error;
+  return { removed: (data || []).length > 0 };
 }
 
 async function getHighlights(userId) {
@@ -2073,5 +2261,6 @@ module.exports = {
   listInvites,
   respondInvite,
   getHighlights,
+  createHighlight, listHighlights, shareHighlight, removeHighlight, normalizeHighlightRecord,
   rowToInvite
 };
