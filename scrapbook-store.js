@@ -676,6 +676,7 @@ async function removeEntries(userId, entryIds) {
 // ---------------------------------------------------------------------------
 const HIGHLIGHT_MAX_MESSAGES = 120;
 const HIGHLIGHT_MAX_SEGMENTS = 24;
+const HIGHLIGHT_MAX_PLAYBACK_EVENTS = 240;
 function highlightText(value, max = 300) {
   return String(value == null ? "" : value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, max);
 }
@@ -760,10 +761,24 @@ function normalizeHighlightRecord(input) {
       authorColor: /^#[0-9a-f]{3,8}$/i.test(String(m.authorColor || "")) ? String(m.authorColor) : "#54a0ff",
       text, sentAt: Math.max(0, Number(m.sentAt) || 0),
       positionSeconds,
+      playbackPaused: typeof m.mediaSnapshot?.paused === "boolean" ? m.mediaSnapshot.paused : null,
       segmentIndex,
       highlightConsent: true, replyTo: reply, reactions
     };
   });
+  const eventsInput = Array.isArray(input.playbackEvents) ? input.playbackEvents : [];
+  if (eventsInput.length > HIGHLIGHT_MAX_PLAYBACK_EVENTS) throw Object.assign(new Error(`A Highlight cannot contain more than ${HIGHLIGHT_MAX_PLAYBACK_EVENTS} playback state events.`), { status: 413 });
+  const playbackEvents = eventsInput.map((event, index) => {
+    const type = event?.type === "pause" || event?.type === "resume" ? event.type : null;
+    const segmentIndex = Number.isInteger(event?.segmentIndex) && event.segmentIndex >= 0 ? event.segmentIndex : null;
+    const positionSeconds = highlightNumber(event?.positionSeconds);
+    const sentAt = Math.max(0, Number(event?.sentAt) || 0);
+    const segment = segmentIndex == null ? null : segments[segmentIndex];
+    if (!type || !segment || positionSeconds == null || sentAt <= 0 || positionSeconds < segment.startSeconds - 3 || positionSeconds > segment.endSeconds + 3) {
+      throw Object.assign(new Error(`Playback state event ${index + 1} is invalid or outside its saved segment.`), { status: 400 });
+    }
+    return { type, segmentIndex, positionSeconds, sentAt };
+  }).sort((a, b) => a.sentAt - b.sentAt);
   const createdAt = Math.max(0, Number(input.createdAt) || now());
   return {
     requestId,
@@ -777,7 +792,7 @@ function normalizeHighlightRecord(input) {
       artwork: /^https:\/\/[^\s/]+\//i.test(String(mediaIn.artwork || "")) ? String(mediaIn.artwork).slice(0, 1000) : null,
       sourceUrl
     },
-    segments, messages, createdAt,
+    segments, messages, playbackEvents, createdAt,
     captureMode: input.captureMode === "ongoing" ? "ongoing" : "historical"
   };
 }

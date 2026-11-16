@@ -7,13 +7,13 @@ for (const name of ['../auth-store','../scrapbook-store']) delete require.cache[
 const { signHighlightMessage, verifyHighlightMessage } = require('../highlight-proof');
 const store = require('../scrapbook-store');
 function makeMessage(messageId='message-1', authorId='member-a') {
-  const mediaSnapshot = { mediaId:'got-s3e9', sourceKey:'got-s3e9', title:'Game of Thrones', platform:'netflix', season:3, episode:9, positionSeconds:2536, durationSeconds:3500, artwork:null, sourceUrl:'https://www.netflix.com/title/123' };
+  const mediaSnapshot = { mediaId:'got-s3e9', sourceKey:'got-s3e9', title:'Game of Thrones', platform:'netflix', season:3, episode:9, positionSeconds:2536, durationSeconds:3500, paused:false, artwork:null, sourceUrl:'https://www.netflix.com/title/123' };
   const m = { messageId, authorId, authorAccountId:authorId==='member-a'?'user-a':'user-b', name:authorId==='member-a'?'Alex':'Maya', avatar:'🙂', color:'#8877aa', authorName:authorId==='member-a'?'Alex':'Maya', authorAvatar:'🙂', authorColor:'#8877aa', sentAt:Date.now(), text:'This is getting interesting!', replyTo:null, mediaSnapshot, highlightRoom:'ROOM01', highlightConsent:true, positionSeconds:2536, mediaId:'got-s3e9', reactions:{'😂':1} };
   m.highlightProof=signHighlightMessage(m); return m;
 }
 function makeHighlight(requestId='hl_123456789abc') {
   const message=makeMessage(); message.segmentIndex=0;
-  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], messages:[message] };
+  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], playbackEvents:[{type:'pause',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+1000},{type:'resume',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+5000}], messages:[message] };
 }
 (async()=>{
   fake.reset();
@@ -47,6 +47,8 @@ function makeHighlight(requestId='hl_123456789abc') {
   const input=makeHighlight();
   const first=await store.createHighlight('user-a',input);
   assert.strictEqual(first.duplicate,false);
+  assert.strictEqual(first.highlight.data.playbackEvents.length,2,'pause/resume events survive server normalization and persistence');
+  assert.strictEqual(first.highlight.data.messages[0].playbackPaused,false,'message pause state is derived from signed media snapshot');
   const retry=await store.createHighlight('user-a',input);
   assert.strictEqual(retry.duplicate,true,'idempotent request returns original record');
   assert.strictEqual((await store.listHighlights('user-a','personal')).length,1);
