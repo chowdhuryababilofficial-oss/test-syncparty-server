@@ -728,6 +728,10 @@ function handlePlaybackMessage(ws,s,p) {
   if((event==="seeking"||event==="seeked")&&Number.isFinite(p.time)&&p.time>=0)x.time=p.time;
   if(event==="play")x.playing=true;
   if(event==="pause")x.playing=false;
+  // A settled seek is one atomic room intent: its timestamp and final media
+  // playing state travel together. This avoids needing separate Pause/Play
+  // commands for player-internal buffering transitions during large seeks.
+  if(event==="seeked"&&typeof p.playing==="boolean")x.playing=p.playing;
   if(event==="ratechange"&&Number.isFinite(p.rate)&&p.rate>=0.25&&p.rate<=4)x.rate=p.rate;
   x.controller=s.clientId;x.controllerAt=playbackClock();
   s.lastIntentBase=Number.isFinite(Number(p.baseRevision))?Number(p.baseRevision):x.revision;

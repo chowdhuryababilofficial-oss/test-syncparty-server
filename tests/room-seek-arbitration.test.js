@@ -55,6 +55,9 @@ function command(s, event, time, overrides = {}) {
 function lastAck(clientId) {
   return [...broadcasted, ...sent].map(x => x.message.payload?.ack).filter(ack => ack?.clientId === clientId).at(-1);
 }
+function ackForCommand(commandId) {
+  return [...broadcasted, ...sent].map(x => x.message.payload?.ack).findLast(ack => ack?.commandId === commandId);
+}
 function lastSystemLine() {
   return broadcasted.map(x => x.message.payload).filter(p => p?.kind === 'system' && /jumped to/.test(p.text || '')).at(-1);
 }
@@ -96,20 +99,40 @@ assert.equal(lastAck('fay')?.accepted, false, 'invalid seek timestamp cannot use
 assert.equal(lastAck('fay')?.reason, 'stale-revision', 'invalid seek timestamp retains stale-revision rejection');
 assert.equal(x.time, timeAfterAccepted, 'invalid seek timestamp cannot move the room timeline');
 
+// A settled seek atomically carries its final playback state. This is what
+// allows the extension to collapse player-internal buffer Pause/Play events
+// into one seek command without leaving the relay marked as playing/paused.
+const activityStart = broadcasted.filter(x => x.message.payload?.kind === 'system').length;
+context.handlePlaybackMessage({ id: 'socket-fay' }, fay, command(fay, 'seeked', 1300,
+  { playing: false, commandId: 'fay-seek-and-pause' }));
+assert.equal(ackForCommand('fay-seek-and-pause')?.accepted, true, 'seek+pause state is accepted as one command');
+assert.equal(x.time, 1300, 'seek+pause commits the target position');
+assert.equal(x.playing, false, 'relay atomically adopts final paused state');
+context.handlePlaybackMessage({ id: 'socket-fay' }, fay, command(fay, 'seeked', 1450,
+  { playing: true, commandId: 'fay-seek-and-resume' }));
+assert.equal(ackForCommand('fay-seek-and-resume')?.accepted, true, 'seek+resume state is accepted as one command');
+assert.equal(x.time, 1450, 'seek+resume commits the target position');
+assert.equal(x.playing, true, 'relay atomically adopts final playing state');
+const seekStateActivity = broadcasted.filter(x => x.message.payload?.kind === 'system').slice(activityStart);
+const timeAfterAtomicSeek = x.time;
+assert.equal(seekStateActivity.length, 2, 'each atomic seek produces exactly one activity line');
+assert.ok(seekStateActivity.every(x => /Fay jumped to/.test(x.message.payload.text)),
+  'atomic seek state changes do not invent separate paused/resumed chat entries');
+
 const another = actor('ana', 'Ana');
 x.playing = false; // avoid the idempotent already-playing shortcut; exercise stale Play arbitration.
 context.handlePlaybackMessage({ id: 'socket-ana' }, another, command(another, 'play', 50,
   { baseRevision: 0, commandId: 'ana-stale-play' }));
 assert.equal(lastAck('ana')?.accepted, false, 'stale Play remains rejected');
 assert.equal(lastAck('ana')?.reason, 'stale-revision', 'stale Play is still protected by revision checks');
-assert.equal(x.time, timeAfterAccepted, 'stale Play cannot roll back the seek');
+assert.equal(x.time, timeAfterAtomicSeek, 'stale Play cannot roll back the seek');
 
 x.holds.set('peer', { name: 'Peer', reasons: new Set(['buffering']) });
 context.handlePlaybackMessage({ id: 'socket-fay' }, fay, command(fay, 'seeked', 2400,
   { baseRevision: x.revision, commandId: 'seek-while-held' }));
 assert.equal(lastAck('fay')?.accepted, false, 'room readiness hold still blocks seek');
 assert.equal(lastAck('fay')?.reason, 'not-ready', 'held room explains the rejection');
-assert.equal(x.time, timeAfterAccepted, 'seek cannot move timeline through a room hold');
+assert.equal(x.time, timeAfterAtomicSeek, 'seek cannot move timeline through a room hold');
 
 x.holds.clear();
 fay.lastSyncSeq = 9; fay.nextSyncSeq = 9;
