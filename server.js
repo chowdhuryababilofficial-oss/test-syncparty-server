@@ -661,9 +661,11 @@ function handlePlaybackMessage(ws,s,p) {
     const ack=p.commandId ? {commandId:String(p.commandId),clientId:s.clientId,
       event:String(p.event),accepted,reason} : null;
     publishPlayback(s.room,event,all?null:ws,all?s:null,ack);
-    if(p.commandId&&accepted&&reason==="applied"&&["play","pause","seeking"].includes(event)){
+    if(p.commandId&&accepted&&reason==="applied"&&["play","pause","seeking","seeked"].includes(event)){
       const seconds=Math.max(0,Math.floor(playbackPosition(x)));
-      const position=`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")}`;
+      const hours=Math.floor(seconds/3600),minutes=Math.floor((seconds%3600)/60),remainder=seconds%60;
+      const position=hours>0?`${hours}:${String(minutes).padStart(2,"0")}:${String(remainder).padStart(2,"0")}`:
+        `${minutes}:${String(remainder).padStart(2,"0")}`;
       const action=event==="play"?"resumed the video":event==="pause"?"paused the video":`jumped to ${position}`;
       broadcast(s.room,{type:"message",payload:{kind:"system",eventId:`playback_${String(p.commandId)}`,
         text:`${s.profile?.name||"A viewer"} ${action}`}});
@@ -688,9 +690,17 @@ function handlePlaybackMessage(ws,s,p) {
   // A fresh explicit, ordered Pause is a safe stop even if a competing rate
   // or playback commit overtook its base revision. Never undo that user's
   // stop by answering with a playing snapshot. Legacy/stale snapshots do
-  // not get this exception; Play and seeks still require causal revision.
+  // not get this exception; Play still requires causal revision. Fresh seeks
+  // use the ordered, freshness-gated intent exception immediately below.
   const explicitPause=event==="pause"&&typeof p.commandId==="string"&&p.commandId.length>0;
-  if(Number.isFinite(Number(p.baseRevision))&&Number(p.baseRevision)<x.revision&&!continuation&&!explicitPause){
+  // A fresh, ordered seek is a new user intent, not a stale room snapshot.
+  // It may arrive after another viewer changed the revision while this user
+  // was dragging the timeline. Server receive order + per-client syncSeq +
+  // sampleAgeMs provide the arbitration; delayed/reordered samples still fail.
+  const explicitSeek=event==="seeked"&&typeof p.commandId==="string"&&p.commandId.length>0&&
+    Number.isFinite(seq)&&Number.isFinite(Number(p.time))&&Number(p.time)>=0&&
+    Number.isFinite(Number(p.sampleAgeMs))&&Number(p.sampleAgeMs)>=0&&Number(p.sampleAgeMs)<=2500;
+  if(Number.isFinite(Number(p.baseRevision))&&Number(p.baseRevision)<x.revision&&!continuation&&!explicitPause&&!explicitSeek){
     reply(false,"stale-revision");return true;
   }
   if(!x.initialized&&Number.isFinite(p.time)&&p.time>=0){
