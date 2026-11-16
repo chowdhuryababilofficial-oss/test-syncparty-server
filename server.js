@@ -3,7 +3,7 @@ const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { normalizeEmail, createEmailUser, authenticateEmail, getUserById, getGoogleUser, createGoogleUser, updateGoogleUser, createSession, resolveSession, revokeSession, publicUser, setPartyIdentity, getAccountPreferences, setQuickReactions, markNotificationsRead } = require("./auth-store");
 const scrapbook = require("./scrapbook-store");
-const { signHighlightMessage } = require("./highlight-proof");
+const { signHighlightMessage, signHighlightInteraction } = require("./highlight-proof");
 
 // Scrapbook maintenance (purge of removed memories past their 30-day restore
 // window, removal-request expiry, ledger compaction): on boot, every 6 hours
@@ -1000,7 +1000,7 @@ wss.on("connection", ws => {
       if (kind === "peer-connection") return;
       const roomWideKinds = new Set([
         "chat", "sticker", "typing", "presence", "profile",
-        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state", "highlight-consent"
+        "messageReaction", "reaction", "buffering", "system", "navigate", "transition-ready", "scrapbook-watch-state", "highlight-consent", "highlight-seek"
       ]);
       if (!roomWideKinds.has(kind) && p.pageKey && s.pageKey && p.pageKey !== s.pageKey) return;
       if ((kind === "sync" || kind === "buffering") && handlePlaybackMessage(ws,s,p)) return;
@@ -1067,7 +1067,22 @@ wss.on("connection", ws => {
       if (kind === "chat" && outgoingPayload.highlightConsent) {
         outgoingPayload.highlightProof = signHighlightMessage(outgoingPayload);
       }
-      broadcast(s.room, { type: "message", payload: outgoingPayload }, kind === "chat" ? null : ws);
+      const interactionKinds = new Set(["reaction", "messageReaction", "typing", "highlight-seek"]);
+      if (interactionKinds.has(kind)) {
+        // Consent and actor identity are relay-owned for timeline interactions,
+        // just like they are for Highlight chat messages. Echo to the sender so
+        // its active local capture receives the same signed event as everyone else.
+        outgoingPayload.highlightConsent = s.highlightConsent === true;
+        outgoingPayload.highlightRoom = s.room;
+        outgoingPayload.actorAccountId = s.profile?.accountId || null;
+        outgoingPayload.sentAt = Date.now();
+        outgoingPayload.eventId = String(p.eventId || `hi_${randId()}`).slice(0, 128);
+        outgoingPayload.highlightInteractionProof = outgoingPayload.highlightConsent
+          ? signHighlightInteraction(outgoingPayload)
+          : null;
+      }
+      const echoToSender = kind === "chat" || interactionKinds.has(kind);
+      broadcast(s.room, { type: "message", payload: outgoingPayload }, echoToSender ? null : ws);
 
       if (kind === "profile" || kind === "presence") broadcastPeers(s.room);
       return;

@@ -2,7 +2,7 @@ const crypto = require("crypto");
 const { AsyncLocalStorage } = require("async_hooks");
 const { getSupabaseAdmin } = require("./supabase");
 const { publicUser } = require("./auth-store");
-const { verifyHighlightMessage } = require("./highlight-proof");
+const { verifyHighlightMessage, verifyHighlightInteraction } = require("./highlight-proof");
 
 function id(prefix = "id") {
   return `${prefix}_${crypto.randomBytes(9).toString("hex")}`;
@@ -677,6 +677,7 @@ async function removeEntries(userId, entryIds) {
 const HIGHLIGHT_MAX_MESSAGES = 120;
 const HIGHLIGHT_MAX_SEGMENTS = 24;
 const HIGHLIGHT_MAX_PLAYBACK_EVENTS = 240;
+const HIGHLIGHT_MAX_INTERACTION_EVENTS = 600;
 function highlightText(value, max = 300) {
   return String(value == null ? "" : value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").slice(0, max);
 }
@@ -779,6 +780,56 @@ function normalizeHighlightRecord(input) {
     }
     return { type, segmentIndex, positionSeconds, sentAt };
   }).sort((a, b) => a.sentAt - b.sentAt);
+  const interactionInput = Array.isArray(input.interactionEvents) ? input.interactionEvents : [];
+  if (interactionInput.length > HIGHLIGHT_MAX_INTERACTION_EVENTS) throw Object.assign(new Error(`A Highlight cannot contain more than ${HIGHLIGHT_MAX_INTERACTION_EVENTS} interaction events.`), { status: 413 });
+  const messageIds = new Set(messages.map(message => message.messageId));
+  const interactionEvents = interactionInput.map((event, index) => {
+    const type = ["quick-reaction", "message-reaction", "typing-start", "typing-stop", "seek"].includes(event?.type) ? event.type : null;
+    const eventId = highlightText(event?.eventId, 128);
+    const actorId = highlightText(event?.actorId, 128);
+    const actorName = highlightText(event?.actorName, 24) || "Guest";
+    const sentAt = Math.max(0, Number(event?.sentAt) || 0);
+    const segmentIndex = Number.isInteger(event?.segmentIndex) && event.segmentIndex >= 0 ? event.segmentIndex : null;
+    const positionSeconds = highlightNumber(event?.positionSeconds);
+    const segment = segmentIndex == null ? null : segments[segmentIndex];
+    const proofKind = type === "quick-reaction" ? "reaction" : type === "message-reaction" ? "messageReaction" :
+      type === "typing-start" || type === "typing-stop" ? "typing" : type === "seek" ? "highlight-seek" : "";
+    const proofInput = {
+      kind: proofKind, eventId, highlightRoom: highlightText(event?.highlightRoom, 80),
+      id: actorId, actorAccountId: highlightText(event?.actorAccountId, 128) || null,
+      name: actorName, avatar: event?.actorAvatar == null || String(event.actorAvatar) === "" ? null : highlightText(event.actorAvatar, 8),
+      sentAt, highlightConsent: event?.highlightConsent === true,
+      emoji: event?.emoji == null ? undefined : highlightText(event.emoji, 32),
+      messageId: event?.messageId == null ? undefined : highlightText(event.messageId, 128),
+      action: event?.action == null ? undefined : (event.action === "remove" ? "remove" : "add"),
+      typing: type === "typing-start" ? true : type === "typing-stop" ? false : undefined,
+      fromSeconds: event?.fromSeconds == null ? undefined : highlightNumber(event.fromSeconds),
+      toSeconds: event?.toSeconds == null ? undefined : highlightNumber(event.toSeconds)
+    };
+    if (!type || !eventId || !actorId || !sentAt || !segment || positionSeconds == null ||
+        positionSeconds < segment.startSeconds - 3 || positionSeconds > segment.endSeconds + 3 ||
+        proofInput.highlightRoom !== captureRoom || !proofInput.highlightConsent ||
+        !verifyHighlightInteraction(proofInput, event?.highlightInteractionProof)) {
+      throw Object.assign(new Error(`Interaction event ${index + 1} has no valid relay-issued consent proof or playback position.`), { status: 403 });
+    }
+    if (type === "quick-reaction" && !proofInput.emoji) throw Object.assign(new Error(`Quick reaction event ${index + 1} has no emoji.`), { status: 400 });
+    if (type === "message-reaction" && (!proofInput.messageId || !messageIds.has(proofInput.messageId) || !["add", "remove"].includes(proofInput.action) || !proofInput.emoji)) {
+      throw Object.assign(new Error(`Message reaction event ${index + 1} is invalid.`), { status: 400 });
+    }
+    if (type === "seek" && (proofInput.fromSeconds == null || proofInput.toSeconds == null ||
+        Math.abs(proofInput.toSeconds - proofInput.fromSeconds) < 0.25 || Math.abs(positionSeconds - proofInput.toSeconds) > 0.25)) {
+      throw Object.assign(new Error(`Seek event ${index + 1} is invalid.`), { status: 400 });
+    }
+    return {
+      eventId, type, actorId, actorAccountId:proofInput.actorAccountId, actorName,
+      actorAvatar:proofInput.avatar || null,
+      sentAt, positionSeconds, segmentIndex, highlightConsent:true,
+      emoji:proofInput.emoji || null, messageId:proofInput.messageId || null, action:proofInput.action || null,
+      fromSeconds:proofInput.fromSeconds ?? null, toSeconds:proofInput.toSeconds ?? null,
+      highlightRoom:proofInput.highlightRoom,
+      highlightInteractionProof:String(event.highlightInteractionProof)
+    };
+  }).sort((a, b) => a.sentAt - b.sentAt);
   const createdAt = Math.max(0, Number(input.createdAt) || now());
   return {
     requestId,
@@ -802,7 +853,7 @@ function normalizeHighlightRecord(input) {
       backdrop: isTmdbUrl(mediaIn.backdrop) ? String(mediaIn.backdrop).slice(0, 1000) : null,
       sourceUrl
     },
-    segments, messages, playbackEvents, createdAt,
+    segments, messages, playbackEvents, interactionEvents, createdAt,
     captureMode: input.captureMode === "ongoing" ? "ongoing" : "historical"
   };
 }

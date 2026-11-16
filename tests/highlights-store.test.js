@@ -4,16 +4,45 @@ const fake = require('./fake-supabase');
 const supabasePath = require.resolve('../supabase');
 require.cache[supabasePath] = { id:supabasePath, filename:supabasePath, loaded:true, exports:fake };
 for (const name of ['../auth-store','../scrapbook-store']) delete require.cache[require.resolve(name)];
-const { signHighlightMessage, verifyHighlightMessage } = require('../highlight-proof');
+const { signHighlightMessage, verifyHighlightMessage, signHighlightInteraction, verifyHighlightInteraction } = require('../highlight-proof');
 const store = require('../scrapbook-store');
 function makeMessage(messageId='message-1', authorId='member-a') {
   const mediaSnapshot = { mediaId:'got-s3e9', sourceKey:'got-s3e9', title:'Game of Thrones', platform:'netflix', season:3, episode:9, positionSeconds:2536, durationSeconds:3500, paused:false, artwork:null, sourceUrl:'https://www.netflix.com/title/123' };
   const m = { messageId, authorId, authorAccountId:authorId==='member-a'?'user-a':'user-b', name:authorId==='member-a'?'Alex':'Maya', avatar:'🙂', color:'#8877aa', authorName:authorId==='member-a'?'Alex':'Maya', authorAvatar:'🙂', authorColor:'#8877aa', sentAt:Date.now(), text:'This is getting interesting!', replyTo:null, mediaSnapshot, highlightRoom:'ROOM01', highlightConsent:true, positionSeconds:2536, mediaId:'got-s3e9', reactions:{'😂':1} };
   m.highlightProof=signHighlightMessage(m); return m;
 }
+function makeInteraction(type='quick-reaction', fields={}) {
+  const kind = type === 'quick-reaction' ? 'reaction' : type === 'message-reaction' ? 'messageReaction' :
+    type === 'typing-start' || type === 'typing-stop' ? 'typing' : 'highlight-seek';
+  const signed = {
+    kind, eventId:fields.eventId || `event-${type}-${Math.random().toString(36).slice(2,8)}`,
+    highlightRoom:'ROOM01', id:'member-b', actorAccountId:'user-b', name:'Maya', avatar:'🐼',
+    sentAt:fields.sentAt || Date.now(), highlightConsent:true,
+    emoji:fields.emoji || (type.includes('reaction') ? '😂' : undefined),
+    messageId:fields.messageId || (type === 'message-reaction' ? 'message-1' : undefined),
+    action:fields.action || (type === 'message-reaction' ? 'add' : undefined),
+    typing:type === 'typing-start' ? true : type === 'typing-stop' ? false : undefined,
+    fromSeconds:fields.fromSeconds, toSeconds:fields.toSeconds
+  };
+  return {
+    eventId:signed.eventId, type, actorId:signed.id, actorAccountId:signed.actorAccountId,
+    actorName:signed.name, actorAvatar:signed.avatar, sentAt:signed.sentAt, positionSeconds:fields.positionSeconds ?? signed.toSeconds ?? 2538,
+    segmentIndex:0, highlightConsent:true, highlightRoom:signed.highlightRoom,
+    emoji:signed.emoji || null, messageId:signed.messageId || null, action:signed.action || null,
+    fromSeconds:signed.fromSeconds ?? null, toSeconds:signed.toSeconds ?? null,
+    highlightInteractionProof:signHighlightInteraction(signed)
+  };
+}
 function makeHighlight(requestId='hl_123456789abc') {
   const message=makeMessage(); message.segmentIndex=0;
-  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], playbackEvents:[{type:'pause',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+1000},{type:'resume',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+5000}], messages:[message] };
+  const interactionEvents = [
+    makeInteraction('quick-reaction',{eventId:'ev-quick',emoji:'🔥',positionSeconds:2537}),
+    makeInteraction('message-reaction',{eventId:'ev-message-reaction',messageId:'message-1',emoji:'❤️',positionSeconds:2538}),
+    makeInteraction('typing-start',{eventId:'ev-typing-start',positionSeconds:2539}),
+    makeInteraction('typing-stop',{eventId:'ev-typing-stop',positionSeconds:2540}),
+    makeInteraction('seek',{eventId:'ev-seek',fromSeconds:2539,toSeconds:2546,positionSeconds:2546})
+  ];
+  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], playbackEvents:[{type:'pause',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+1000},{type:'resume',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+5000}], interactionEvents, messages:[message] };
 }
 (async()=>{
   fake.reset();
@@ -21,6 +50,10 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual(verifyHighlightMessage(signed),true,'relay signature verifies for the original payload');
   assert.strictEqual(verifyHighlightMessage({...signed,text:'tampered message'}),false,'relay signature rejects tampered message text');
   assert.strictEqual(verifyHighlightMessage({...signed,mediaSnapshot:{...signed.mediaSnapshot,positionSeconds:999}}),false,'relay signature rejects tampered playback position');
+  const verifiedInteraction = makeInteraction('quick-reaction',{eventId:'verify-interaction',emoji:'🎉',positionSeconds:2537});
+  const interactionProofInput = {kind:'reaction',eventId:verifiedInteraction.eventId,highlightRoom:'ROOM01',id:verifiedInteraction.actorId,actorAccountId:verifiedInteraction.actorAccountId,name:verifiedInteraction.actorName,avatar:verifiedInteraction.actorAvatar,sentAt:verifiedInteraction.sentAt,highlightConsent:true,emoji:verifiedInteraction.emoji};
+  assert.strictEqual(verifyHighlightInteraction(interactionProofInput,verifiedInteraction.highlightInteractionProof),true,'relay signature verifies for a consented reaction event');
+  assert.strictEqual(verifyHighlightInteraction({...interactionProofInput,emoji:'💀'},verifiedInteraction.highlightInteractionProof),false,'relay signature rejects a tampered reaction event');
   const forged=makeHighlight('hl_forged12345'); forged.messages[0].highlightProof='v1.forged';
   assert.throws(()=>store.normalizeHighlightRecord(forged),/valid relay-issued/,'forged opt-in is rejected');
   const mixedMedia=makeHighlight('hl_mixedmedia123');
@@ -49,6 +82,11 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual(first.duplicate,false);
   assert.strictEqual(first.highlight.data.playbackEvents.length,2,'pause/resume events survive server normalization and persistence');
   assert.strictEqual(first.highlight.data.messages[0].playbackPaused,false,'message pause state is derived from signed media snapshot');
+  assert.strictEqual(first.highlight.data.interactionEvents.length,5,'quick reactions, message reactions, typing, and seek events are persisted');
+  assert.strictEqual(first.highlight.data.interactionEvents[0].actorAvatar,'🐼','relay-signed actor avatars survive server normalization');
+  const badInteraction=makeHighlight('hl_forged_interaction_123');
+  badInteraction.interactionEvents[0].emoji='💀';
+  assert.throws(()=>store.normalizeHighlightRecord(badInteraction),/relay-issued consent proof/,'server rejects tampered interaction history');
   const retry=await store.createHighlight('user-a',input);
   assert.strictEqual(retry.duplicate,true,'idempotent request returns original record');
   assert.strictEqual((await store.listHighlights('user-a','personal')).length,1);
@@ -111,5 +149,5 @@ function makeHighlight(requestId='hl_123456789abc') {
     if (previousToken == null) delete process.env.TMDB_API_TOKEN;
     else process.env.TMDB_API_TOKEN = previousToken;
   }
-  console.log('Highlights store tests: PASS (forged consent, idempotency, private ownership, explicit share, soft delete, TMDB artwork filtering and legacy recovery)');
+  console.log('Highlights store tests: PASS (forged message/event consent, interaction signatures, quick/message reactions, typing, seek history, idempotency, private ownership, sharing, deletion, TMDB artwork recovery)');
 })().catch(error=>{console.error(error);process.exitCode=1;});
