@@ -789,7 +789,17 @@ function normalizeHighlightRecord(input) {
       platform: highlightText(mediaIn.platform, 80),
       season: mediaIn.season != null && String(mediaIn.season).trim() !== "" && Number.isInteger(Number(mediaIn.season)) && Number(mediaIn.season) >= 0 ? Number(mediaIn.season) : null,
       episode: Number.isInteger(Number(mediaIn.episode)) && Number(mediaIn.episode) > 0 ? Number(mediaIn.episode) : null,
-      artwork: /^https:\/\/[^\s/]+\//i.test(String(mediaIn.artwork || "")) ? String(mediaIn.artwork).slice(0, 1000) : null,
+      canonicalTitle: highlightText(mediaIn.canonicalTitle || title, 240).trim() || title,
+      contentType: ["movie", "series", "anime"].includes(String(mediaIn.contentType || "").toLowerCase()) ? String(mediaIn.contentType).toLowerCase() : null,
+      metadataProvider: highlightText(mediaIn.metadataProvider, 40).toLowerCase() || null,
+      metadataId: highlightText(mediaIn.metadataId, 80) || null,
+      metadataYear: Number(mediaIn.metadataYear) > 0 ? Math.round(Number(mediaIn.metadataYear)) : null,
+      seriesTitle: highlightText(mediaIn.seriesTitle, 240) || null,
+      titleCandidates: (Array.isArray(mediaIn.titleCandidates) ? mediaIn.titleCandidates : []).map(v => highlightText(v, 240)).filter(Boolean).slice(0, 8),
+      typeHints: (Array.isArray(mediaIn.typeHints) ? mediaIn.typeHints : []).map(v => highlightText(v, 40)).filter(Boolean).slice(0, 12),
+      pathname: highlightText(mediaIn.pathname, 500) || null,
+      artwork: isTmdbUrl(mediaIn.artwork) ? String(mediaIn.artwork).slice(0, 1000) : null,
+      backdrop: isTmdbUrl(mediaIn.backdrop) ? String(mediaIn.backdrop).slice(0, 1000) : null,
       sourceUrl
     },
     segments, messages, playbackEvents, createdAt,
@@ -802,8 +812,62 @@ function highlightRowView(row) {
     requestId: row.request_id, data: row.data || {}, createdAt: Number(row.created_at || 0), updatedAt: Number(row.updated_at || 0)
   };
 }
+async function resolveHighlightArtwork(record) {
+  const media = record?.media;
+  if (!media) return record;
+  // Page-derived logos/avatars are never trusted as movie or series art.
+  const previousArtwork = isTmdbUrl(media.artwork) ? media.artwork : null;
+  const previousBackdrop = isTmdbUrl(media.backdrop) ? media.backdrop : null;
+  media.artwork = previousArtwork;
+  media.backdrop = previousBackdrop;
+  if (!process.env.TMDB_API_TOKEN) return record;
+  try {
+    const sourcePath = (() => { try { return new URL(media.sourceUrl || "").pathname; } catch { return media.pathname || ""; } })();
+    const meta = {
+      title: media.title,
+      seriesTitle: media.seriesTitle || media.canonicalTitle || media.title,
+      titleCandidates: Array.isArray(media.titleCandidates) ? media.titleCandidates : [],
+      pathname: media.pathname || sourcePath,
+      platform: media.platform || "",
+      season: media.season,
+      episode: media.episode,
+      seriesYear: media.metadataYear,
+      typeHints: Array.isArray(media.typeHints) ? media.typeHints : [],
+      metadataYear: media.metadataYear
+    };
+    const provisional = {
+      contentType: media.contentType || (media.season != null && media.episode != null ? "series" : null),
+      title: media.canonicalTitle || media.title,
+      canonicalTitle: media.canonicalTitle || media.title,
+      season: media.season,
+      episode: media.episode,
+      metadataYear: media.metadataYear,
+      metadataProvider: media.metadataProvider || "",
+      metadataId: media.metadataId || ""
+    };
+    const resolved = await require("./metadata-resolver").resolve({ meta, provisional });
+    if (resolved?.eligible && String(resolved.metadataProvider || "").toLowerCase() === "tmdb" && /^[1-9]\d*$/.test(String(resolved.metadataId || ""))) {
+      media.metadataProvider = "tmdb";
+      media.metadataId = String(resolved.metadataId);
+      media.metadataYear = Number(resolved.metadataYear) > 0 ? Number(resolved.metadataYear) : media.metadataYear;
+      media.contentType = ["movie", "series", "anime"].includes(resolved.contentType) ? resolved.contentType : media.contentType;
+      media.title = highlightText(resolved.title || media.title, 240) || media.title;
+      media.canonicalTitle = highlightText(resolved.canonicalTitle || resolved.title || media.canonicalTitle, 240) || media.title;
+      media.artwork = isTmdbUrl(resolved.artwork) ? resolved.artwork : previousArtwork;
+      media.backdrop = isTmdbUrl(resolved.backdrop) ? resolved.backdrop : previousBackdrop;
+      if (resolved.episodeMetadataProvider) media.episodeMetadataProvider = String(resolved.episodeMetadataProvider).slice(0,40);
+      if (resolved.episodeMetadataId) media.episodeMetadataId = String(resolved.episodeMetadataId).slice(0,80);
+    }
+  } catch (error) {
+    // Artwork resolution is best-effort and must never prevent the Highlight
+    // itself from being saved or alter message/playback integrity.
+    console.warn("[SyncParty Highlights] artwork resolution unavailable:", error?.message || error);
+  }
+  return record;
+}
 async function createHighlight(userId, input) {
   const record = normalizeHighlightRecord(input);
+  await resolveHighlightArtwork(record);
   const sb = getSupabaseAdmin();
   const existing = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", record.requestId).maybeSingle());
   if (existing) return { highlight: highlightRowView(existing), duplicate: true };
@@ -836,7 +900,31 @@ async function listHighlights(userId, scope = "personal") {
   }
   const { data, error } = await query.order("created_at", { ascending: false }).limit(200);
   if (error) throw error;
-  return (data || []).map(highlightRowView);
+  const rows = data || [];
+  // Lazily repair older Highlight cards that were saved before canonical
+  // artwork resolution existed. Cap work per list request and update only the
+  // existing JSON data; ownership, scope, timestamps and message history stay intact.
+  let recoveryBudget = 4;
+  return Promise.all(rows.map(async row => {
+    const media = row?.data?.media;
+    if (!media || !process.env.TMDB_API_TOKEN ||
+        (isTmdbUrl(media.artwork) && isTmdbUrl(media.backdrop)) || recoveryBudget <= 0) {
+      return highlightRowView(row);
+    }
+    recoveryBudget--;
+    try {
+      const repaired = { ...(row.data || {}), media:{ ...media } };
+      await resolveHighlightArtwork(repaired);
+      if (!isTmdbUrl(repaired.media.artwork) && !isTmdbUrl(repaired.media.backdrop)) return highlightRowView(row);
+      const updatedData = { ...(row.data || {}), media:repaired.media };
+      const updatedRow = await q(sb.from("scrapbook_highlights").update({ data:updatedData, updated_at:now() })
+        .eq("id", String(row.id)).eq("user_id", String(row.user_id)).maybeSingle());
+      return highlightRowView(updatedRow || { ...row, data:updatedData });
+    } catch (repairError) {
+      console.warn("[SyncParty Highlights] artwork recovery skipped:", repairError?.message || repairError);
+      return highlightRowView(row);
+    }
+  }));
 }
 async function shareHighlight(userId, highlightId) {
   const sb = getSupabaseAdmin();

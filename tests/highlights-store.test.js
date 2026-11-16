@@ -65,5 +65,51 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual(deleted.removed,true);
   assert.strictEqual((await store.listHighlights('user-b','shared')).length,0,'deleting the shared copy removes it from the shared listing');
   assert.strictEqual((await store.listHighlights('user-a','personal')).length,1,'deleting the shared copy does not delete the personal Highlight');
-  console.log('Highlights store tests: PASS (forged consent, idempotency, private ownership, explicit share, soft delete)');
+
+  // Older records may contain a streaming-site logo or no usable artwork.
+  // Verify that a later list request repairs the existing JSON record through
+  // the server's real TMDB metadata resolver, without changing ownership.
+  const previousToken = process.env.TMDB_API_TOKEN;
+  const previousFetch = global.fetch;
+  try {
+    delete process.env.TMDB_API_TOKEN;
+    const legacyArtwork = makeHighlight('hl_artwork_recovery_123');
+    legacyArtwork.media.artwork = 'https://reanime.cz/assets/provider-logo.png';
+    legacyArtwork.media.backdrop = 'https://7movies.ac/images/site-logo.png';
+    const legacySaved = await store.createHighlight('user-a', legacyArtwork);
+    assert.strictEqual(legacySaved.highlight.data.media.artwork, null, 'streaming-site logos are not saved as movie artwork');
+    assert.strictEqual(legacySaved.highlight.data.media.backdrop, null, 'streaming-site logos are not saved as backdrops');
+
+    process.env.TMDB_API_TOKEN = 'test-tmdb-token';
+    global.fetch = async url => {
+      const parsed = new URL(String(url));
+      let payload = {};
+      if (parsed.pathname === '/3/search/tv') {
+        payload = { results:[{ id:1399, name:'Game of Thrones', original_name:'Game of Thrones', first_air_date:'2011-04-17', poster_path:'/got-poster.jpg', backdrop_path:'/got-backdrop.jpg' }] };
+      } else if (parsed.pathname === '/3/search/movie') {
+        payload = { results:[] };
+      } else if (parsed.pathname === '/3/tv/1399') {
+        payload = { id:1399, name:'Game of Thrones', first_air_date:'2011-04-17', number_of_seasons:3,
+          poster_path:'/got-poster.jpg', backdrop_path:'/got-backdrop.jpg',
+          seasons:[{season_number:1,episode_count:10},{season_number:2,episode_count:10},{season_number:3,episode_count:10}] };
+      } else if (parsed.pathname === '/3/tv/1399/season/3/episode/9') {
+        payload = { id:887, name:'The Rains of Castamere', runtime:55 };
+      }
+      return { ok:true, status:200, json:async()=>payload };
+    };
+    const refreshed = await store.listHighlights('user-a','personal');
+    const repaired = refreshed.find(row => row.requestId === legacyArtwork.requestId);
+    assert(repaired, 'legacy Highlight remains visible after artwork repair');
+    assert.strictEqual(repaired.data.media.metadataProvider, 'tmdb');
+    assert.strictEqual(repaired.data.media.metadataId, '1399');
+    assert.strictEqual(repaired.data.media.artwork, 'https://image.tmdb.org/t/p/w780/got-poster.jpg', 'legacy Highlight receives the canonical TMDB poster');
+    assert.strictEqual(repaired.data.media.backdrop, 'https://image.tmdb.org/t/p/w1280/got-backdrop.jpg', 'legacy Highlight receives the canonical TMDB backdrop');
+    const persistedArtwork = fake.tables.scrapbook_highlights.find(row => row.request_id === legacyArtwork.requestId);
+    assert.strictEqual(persistedArtwork.data.media.artwork, repaired.data.media.artwork, 'resolved artwork is persisted to the existing Highlight row');
+  } finally {
+    global.fetch = previousFetch;
+    if (previousToken == null) delete process.env.TMDB_API_TOKEN;
+    else process.env.TMDB_API_TOKEN = previousToken;
+  }
+  console.log('Highlights store tests: PASS (forged consent, idempotency, private ownership, explicit share, soft delete, TMDB artwork filtering and legacy recovery)');
 })().catch(error=>{console.error(error);process.exitCode=1;});
