@@ -778,7 +778,7 @@ function normalizeHighlightRecord(input) {
     if (!type || !segment || positionSeconds == null || sentAt <= 0 || positionSeconds < segment.startSeconds - 3 || positionSeconds > segment.endSeconds + 3) {
       throw Object.assign(new Error(`Playback state event ${index + 1} is invalid or outside its saved segment.`), { status: 400 });
     }
-    return { type, segmentIndex, positionSeconds, sentAt };
+    return { type, segmentIndex, positionSeconds, sentAt, actorName:highlightText(event?.actorName, 24) || null };
   }).sort((a, b) => a.sentAt - b.sentAt);
   const interactionInput = Array.isArray(input.interactionEvents) ? input.interactionEvents : [];
   if (interactionInput.length > HIGHLIGHT_MAX_INTERACTION_EVENTS) throw Object.assign(new Error(`A Highlight cannot contain more than ${HIGHLIGHT_MAX_INTERACTION_EVENTS} interaction events.`), { status: 413 });
@@ -854,6 +854,8 @@ function normalizeHighlightRecord(input) {
       sourceUrl
     },
     segments, messages, playbackEvents, interactionEvents, createdAt,
+    createdBy: highlightText(input.createdBy, 128) || null,
+    createdByName: highlightText(input.createdByName, 24) || null,
     captureMode: input.captureMode === "ongoing" ? "ongoing" : "historical"
   };
 }
@@ -920,23 +922,64 @@ async function createHighlight(userId, input) {
   const record = normalizeHighlightRecord(input);
   await resolveHighlightArtwork(record);
   const sb = getSupabaseAdmin();
-  const existing = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", record.requestId).maybeSingle());
-  if (existing) return { highlight: highlightRowView(existing), duplicate: true };
-  const t = now();
-  const row = {
-    id: id("hl"), user_id: String(userId), scope: "personal", relation_id: null,
-    request_id: record.requestId, data: record, created_at: t, updated_at: t, deleted_at: null
-  };
-  const { data, error } = await sb.from("scrapbook_highlights").insert(row).select("*").single();
-  if (error) {
-    // A concurrent retry can win the unique (user_id, request_id) insert.
-    if (String(error.code) === "23505") {
-      const retry = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", String(userId)).eq("request_id", record.requestId).maybeSingle());
-      if (retry) return { highlight: highlightRowView(retry), duplicate: true };
-    }
-    throw error;
+  const ownerId = String(userId);
+  const requestedRelationId = highlightText(input?.relationId, 128);
+  let existing = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", ownerId).eq("request_id", record.requestId).maybeSingle());
+  let personalRow = existing;
+  let duplicate = !!existing;
+  if (!personalRow) {
+    const t = now();
+    const row = {
+      id: id("hl"), user_id: ownerId, scope: "personal", relation_id: null,
+      request_id: record.requestId, data: record, created_at: t, updated_at: t, deleted_at: null
+    };
+    const { data, error } = await sb.from("scrapbook_highlights").insert(row).select("*").single();
+    if (error) {
+      // A concurrent retry can win the unique (user_id, request_id) insert.
+      if (String(error.code) === "23505") {
+        personalRow = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", ownerId).eq("request_id", record.requestId).maybeSingle());
+        if (!personalRow) throw error;
+        duplicate = true;
+      } else throw error;
+    } else personalRow = data;
   }
-  return { highlight: highlightRowView(data), duplicate: false };
+
+  // The relation is captured when the highlight begins. Only share into that
+  // exact relationship, and only while it is still the owner's active story.
+  // A stale/ended relation never blocks the personal save and never redirects
+  // the memory into a newer relationship.
+  let sharedHighlight = null;
+  let shared = false;
+  if (requestedRelationId) {
+    const sharedRequestId = "hl_share_" + crypto.createHash("sha256").update(`${ownerId}|${record.requestId}|${requestedRelationId}`).digest("hex").slice(0, 48);
+    let sharedRow = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", ownerId).eq("request_id", sharedRequestId).maybeSingle());
+    // Existing shared copies remain valid historical memories even if the
+    // relationship later ends. A soft-deleted copy, however, is never revived.
+    if (sharedRow && !sharedRow.deleted_at && String(sharedRow.relation_id) === requestedRelationId && sharedRow.scope === "shared") {
+      shared = true;
+      sharedHighlight = highlightRowView(sharedRow);
+    } else if (!sharedRow) {
+      const activeRelation = await getActiveRelationRow(ownerId);
+      if (activeRelation && String(activeRelation.id) === requestedRelationId && isActiveRelationRow(activeRelation)) {
+        const t = now();
+        const copy = { id:id("hl"), user_id:ownerId, scope:"shared", relation_id:requestedRelationId,
+          request_id:sharedRequestId, data:{ ...(personalRow.data || record), sharedFromRequestId:record.requestId },
+          created_at:t, updated_at:t, deleted_at:null };
+        const { data, error } = await sb.from("scrapbook_highlights").insert(copy).select("*").single();
+        if (error) {
+          if (String(error.code) === "23505") {
+            sharedRow = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", ownerId).eq("request_id", sharedRequestId).maybeSingle());
+            if (!sharedRow) throw error;
+          } else throw error;
+        } else sharedRow = data;
+        if (sharedRow && !sharedRow.deleted_at && String(sharedRow.relation_id) === requestedRelationId && sharedRow.scope === "shared") {
+          shared = true;
+          sharedHighlight = highlightRowView(sharedRow);
+        }
+      }
+    }
+  }
+  return { highlight: highlightRowView(personalRow), duplicate, shared, sharedHighlight };
 }
 async function listHighlights(userId, scope = "personal") {
   const sb = getSupabaseAdmin();

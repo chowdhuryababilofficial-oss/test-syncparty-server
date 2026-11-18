@@ -416,7 +416,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/highlights" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const result=await scrapbook.createHighlight(user.id,b.highlight||b);
-      json(res,200,{ok:true,persisted:true,duplicate:!!result.duplicate,highlight:result.highlight});return;
+      json(res,200,{ok:true,persisted:true,duplicate:!!result.duplicate,highlight:result.highlight,shared:!!result.shared,sharedHighlight:result.sharedHighlight||null});return;
     }
     if (path === "/api/scrapbook/highlights/share" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
@@ -728,10 +728,6 @@ function handlePlaybackMessage(ws,s,p) {
   if((event==="seeking"||event==="seeked")&&Number.isFinite(p.time)&&p.time>=0)x.time=p.time;
   if(event==="play")x.playing=true;
   if(event==="pause")x.playing=false;
-  // A settled seek is one atomic room intent: its timestamp and final media
-  // playing state travel together. This avoids needing separate Pause/Play
-  // commands for player-internal buffering transitions during large seeks.
-  if(event==="seeked"&&typeof p.playing==="boolean")x.playing=p.playing;
   if(event==="ratechange"&&Number.isFinite(p.rate)&&p.rate>=0.25&&p.rate<=4)x.rate=p.rate;
   x.controller=s.clientId;x.controllerAt=playbackClock();
   s.lastIntentBase=Number.isFinite(Number(p.baseRevision))?Number(p.baseRevision):x.revision;

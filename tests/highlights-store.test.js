@@ -42,7 +42,7 @@ function makeHighlight(requestId='hl_123456789abc') {
     makeInteraction('typing-stop',{eventId:'ev-typing-stop',positionSeconds:2540}),
     makeInteraction('seek',{eventId:'ev-seek',fromSeconds:2539,toSeconds:2546,positionSeconds:2546})
   ];
-  return { requestId, title:'The Red Wedding', note:'', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], playbackEvents:[{type:'pause',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+1000},{type:'resume',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+5000}], interactionEvents, messages:[message] };
+  return { requestId, title:'The Red Wedding', note:'', createdBy:'member-a', createdByName:'Alex', captureMode:'historical', createdAt:Date.now(), media:{mediaId:'got-s3e9',title:'Game of Thrones',platform:'netflix',season:3,episode:9,sourceUrl:'https://www.netflix.com/title/123'}, segments:[{mediaId:'got-s3e9',startSeconds:2536,endSeconds:2560,startedAt:message.sentAt,endedAt:message.sentAt+24000}], playbackEvents:[{type:'pause',actorName:'Alex',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+1000},{type:'resume',actorName:'Maya',segmentIndex:0,positionSeconds:2540,sentAt:message.sentAt+5000}], interactionEvents, messages:[message] };
 }
 (async()=>{
   fake.reset();
@@ -81,6 +81,9 @@ function makeHighlight(requestId='hl_123456789abc') {
   const first=await store.createHighlight('user-a',input);
   assert.strictEqual(first.duplicate,false);
   assert.strictEqual(first.highlight.data.playbackEvents.length,2,'pause/resume events survive server normalization and persistence');
+  assert.strictEqual(first.highlight.data.playbackEvents[0].actorName, 'Alex', 'playback system actor survives server normalization');
+  assert.strictEqual(first.highlight.data.createdBy, 'member-a', 'highlight creator identity survives server normalization');
+  assert.strictEqual(first.highlight.data.createdByName, 'Alex', 'highlight creator display name survives server normalization');
   assert.strictEqual(first.highlight.data.messages[0].playbackPaused,false,'message pause state is derived from signed media snapshot');
   assert.strictEqual(first.highlight.data.interactionEvents.length,5,'quick reactions, message reactions, typing, and seek events are persisted');
   assert.strictEqual(first.highlight.data.interactionEvents[0].actorAvatar,'🐼','relay-signed actor avatars survive server normalization');
@@ -99,10 +102,43 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual((await store.listHighlights('user-b','shared')).length,1,'active relationship partner can read explicitly shared Highlight');
   const sharedRetry=await store.shareHighlight('user-a',first.highlight.id);
   assert.strictEqual(sharedRetry.duplicate,true,'repeated share does not create a second shared record');
+  // Automatic Our Story persistence: a capture created while offline may first
+  // arrive as a personal row, then a retry carrying the captured relation ID
+  // must repair the missing shared copy without duplicating either row.
+  const automaticInput = makeHighlight('hl_auto_story_123456');
+  const personalFirst = await store.createHighlight('user-a', automaticInput);
+  assert.strictEqual(personalFirst.shared, false, 'without a captured active relation, save remains personal');
+  const automaticRetry = await store.createHighlight('user-a', { ...automaticInput, relationId:'rel-a-b' });
+  assert.strictEqual(automaticRetry.duplicate, true, 'retry reuses the existing personal highlight');
+  assert.strictEqual(automaticRetry.shared, true, 'retry repairs the missing Our Story copy');
+  assert.strictEqual(automaticRetry.sharedHighlight.relationId, 'rel-a-b', 'shared copy belongs to the exact captured relation');
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length, 2, 'partner sees the automatically shared highlight');
+  const automaticAgain = await store.createHighlight('user-a', { ...automaticInput, relationId:'rel-a-b' });
+  assert.strictEqual(automaticAgain.shared, true, 'repeat save confirms the same shared copy');
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length, 2, 'automatic sharing is idempotent');
+  const wrongRelation = await store.createHighlight('user-a', { ...makeHighlight('hl_wrong_relation_123'), relationId:'rel-not-owned' });
+  assert.strictEqual(wrongRelation.shared, false, 'unowned or inactive relation ID cannot create a shared copy');
   const deleted=await store.removeHighlight('user-a',shared.highlight.id);
   assert.strictEqual(deleted.removed,true);
-  assert.strictEqual((await store.listHighlights('user-b','shared')).length,0,'deleting the shared copy removes it from the shared listing');
-  assert.strictEqual((await store.listHighlights('user-a','personal')).length,1,'deleting the shared copy does not delete the personal Highlight');
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length,1,'deleting the explicit shared copy leaves the independent automatic Our Story copy intact');
+  const automaticSharedRow = (await store.listHighlights('user-a','shared')).find(row => row.data?.sharedFromRequestId === automaticInput.requestId);
+  assert(automaticSharedRow, 'automatic Our Story copy remains independently addressable');
+  await store.removeHighlight('user-a', automaticSharedRow.id);
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length,0,'deleting both shared copies removes them from the partner listing');
+  const afterDeleteRetry = await store.createHighlight('user-a', { ...automaticInput, relationId:'rel-a-b' });
+  assert.strictEqual(afterDeleteRetry.shared, false, 'a deleted shared copy is not silently resurrected by a duplicate capture retry');
+  assert.strictEqual((await store.listHighlights('user-b','shared')).length,0, 'deleted Our Story highlight remains deleted after retry');
+  assert.strictEqual((await store.listHighlights('user-a','personal')).length,3,'deleting shared copies does not delete any personal Highlights');
+
+  // A user may manually share from Scrapbook before the next capture retry.
+  // The automatic capture path must converge on that exact relation-scoped
+  // request ID rather than create a second Our Story copy.
+  const convergeInput = makeHighlight('hl_manual_auto_converge_123');
+  const convergePersonal = await store.createHighlight('user-a', convergeInput);
+  const manualCopy = await store.shareHighlight('user-a', convergePersonal.highlight.id);
+  const autoRetryAfterManual = await store.createHighlight('user-a', { ...convergeInput, relationId:'rel-a-b' });
+  assert.strictEqual(autoRetryAfterManual.shared, true, 'automatic retry recognizes an already manually shared copy');
+  assert.strictEqual(autoRetryAfterManual.sharedHighlight.id, manualCopy.highlight.id, 'manual and automatic sharing converge on the same shared record');
 
   // Older records may contain a streaming-site logo or no usable artwork.
   // Verify that a later list request repairs the existing JSON record through
@@ -149,5 +185,5 @@ function makeHighlight(requestId='hl_123456789abc') {
     if (previousToken == null) delete process.env.TMDB_API_TOKEN;
     else process.env.TMDB_API_TOKEN = previousToken;
   }
-  console.log('Highlights store tests: PASS (forged message/event consent, interaction signatures, quick/message reactions, typing, seek history, idempotency, private ownership, sharing, deletion, TMDB artwork recovery)');
+  console.log('Highlights store tests: PASS (forged message/event consent, interaction signatures, quick/message reactions, typing, seek history, idempotency, private ownership, explicit and automatic Our Story sharing, retry repair, deletion, TMDB artwork recovery)');
 })().catch(error=>{console.error(error);process.exitCode=1;});
