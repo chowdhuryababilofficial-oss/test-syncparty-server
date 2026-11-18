@@ -112,12 +112,14 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual(automaticRetry.duplicate, true, 'retry reuses the existing personal highlight');
   assert.strictEqual(automaticRetry.shared, true, 'retry repairs the missing Our Story copy');
   assert.strictEqual(automaticRetry.sharedHighlight.relationId, 'rel-a-b', 'shared copy belongs to the exact captured relation');
+  assert.strictEqual(automaticRetry.sharedReason, null, 'successful shared persistence has no failure reason');
   assert.strictEqual((await store.listHighlights('user-b','shared')).length, 2, 'partner sees the automatically shared highlight');
   const automaticAgain = await store.createHighlight('user-a', { ...automaticInput, relationId:'rel-a-b' });
   assert.strictEqual(automaticAgain.shared, true, 'repeat save confirms the same shared copy');
   assert.strictEqual((await store.listHighlights('user-b','shared')).length, 2, 'automatic sharing is idempotent');
   const wrongRelation = await store.createHighlight('user-a', { ...makeHighlight('hl_wrong_relation_123'), relationId:'rel-not-owned' });
   assert.strictEqual(wrongRelation.shared, false, 'unowned or inactive relation ID cannot create a shared copy');
+  assert.strictEqual(wrongRelation.sharedReason, 'captured-relation-inactive', 'inactive captured relation is explicitly distinguished from a transient unconfirmed share');
   const deleted=await store.removeHighlight('user-a',shared.highlight.id);
   assert.strictEqual(deleted.removed,true);
   assert.strictEqual((await store.listHighlights('user-b','shared')).length,1,'deleting the explicit shared copy leaves the independent automatic Our Story copy intact');
@@ -127,6 +129,7 @@ function makeHighlight(requestId='hl_123456789abc') {
   assert.strictEqual((await store.listHighlights('user-b','shared')).length,0,'deleting both shared copies removes them from the partner listing');
   const afterDeleteRetry = await store.createHighlight('user-a', { ...automaticInput, relationId:'rel-a-b' });
   assert.strictEqual(afterDeleteRetry.shared, false, 'a deleted shared copy is not silently resurrected by a duplicate capture retry');
+  assert.strictEqual(afterDeleteRetry.sharedReason, 'shared-copy-deleted', 'a deliberately deleted shared copy is reported as terminal and is not retried forever');
   assert.strictEqual((await store.listHighlights('user-b','shared')).length,0, 'deleted Our Story highlight remains deleted after retry');
   assert.strictEqual((await store.listHighlights('user-a','personal')).length,3,'deleting shared copies does not delete any personal Highlights');
 

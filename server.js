@@ -416,7 +416,7 @@ const httpServer = http.createServer(async (req, res) => {
     if (path === "/api/scrapbook/highlights" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);
       const result=await scrapbook.createHighlight(user.id,b.highlight||b);
-      json(res,200,{ok:true,persisted:true,duplicate:!!result.duplicate,highlight:result.highlight,shared:!!result.shared,sharedHighlight:result.sharedHighlight||null});return;
+      json(res,200,{ok:true,persisted:true,duplicate:!!result.duplicate,highlight:result.highlight,shared:!!result.shared,sharedHighlight:result.sharedHighlight||null,sharedReason:result.sharedReason||null});return;
     }
     if (path === "/api/scrapbook/highlights/share" && req.method === "POST") {
       const user=await requireUser(req,res); if(!user)return; const b=await readJson(req);

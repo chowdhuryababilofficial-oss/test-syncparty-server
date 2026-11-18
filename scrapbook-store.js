@@ -950,6 +950,7 @@ async function createHighlight(userId, input) {
   // the memory into a newer relationship.
   let sharedHighlight = null;
   let shared = false;
+  let sharedReason = null;
   if (requestedRelationId) {
     const sharedRequestId = "hl_share_" + crypto.createHash("sha256").update(`${ownerId}|${record.requestId}|${requestedRelationId}`).digest("hex").slice(0, 48);
     let sharedRow = await q(sb.from("scrapbook_highlights").select("*").eq("user_id", ownerId).eq("request_id", sharedRequestId).maybeSingle());
@@ -958,6 +959,8 @@ async function createHighlight(userId, input) {
     if (sharedRow && !sharedRow.deleted_at && String(sharedRow.relation_id) === requestedRelationId && sharedRow.scope === "shared") {
       shared = true;
       sharedHighlight = highlightRowView(sharedRow);
+    } else if (sharedRow?.deleted_at) {
+      sharedReason = "shared-copy-deleted";
     } else if (!sharedRow) {
       const activeRelation = await getActiveRelationRow(ownerId);
       if (activeRelation && String(activeRelation.id) === requestedRelationId && isActiveRelationRow(activeRelation)) {
@@ -975,11 +978,11 @@ async function createHighlight(userId, input) {
         if (sharedRow && !sharedRow.deleted_at && String(sharedRow.relation_id) === requestedRelationId && sharedRow.scope === "shared") {
           shared = true;
           sharedHighlight = highlightRowView(sharedRow);
-        }
-      }
-    }
+        } else sharedReason = "shared-copy-conflict";
+      } else sharedReason = "captured-relation-inactive";
+    } else sharedReason = "shared-copy-conflict";
   }
-  return { highlight: highlightRowView(personalRow), duplicate, shared, sharedHighlight };
+  return { highlight: highlightRowView(personalRow), duplicate, shared, sharedHighlight, sharedReason };
 }
 async function listHighlights(userId, scope = "personal") {
   const sb = getSupabaseAdmin();
